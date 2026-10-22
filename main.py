@@ -1,13 +1,15 @@
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
 
 from openai import OpenAI
 from openai.types.responses import Response
 
+from exception import LimitExceededError
 from logging_config import setup_logging
-from trace_model import AgentTrace, LLMCallTrace, ToolCallTrace
+from trace_model import AgentTrace, LLMCallTrace, ToolCallTrace, AgentStatus
 
 PROJECT_ROOT = Path.cwd().resolve()
 logger = logging.getLogger(__name__)
@@ -72,7 +74,7 @@ def record_success_llm_trace(trace: AgentTrace, start: float, total_steps: int, 
     ))
 
 
-def record_exception_llm_trace(trace: AgentTrace, start: float, total_steps: int, retry_time: int, error: str):
+def record_exception_llm_trace(trace: AgentTrace, start: float, total_steps: int, attempt: int, error: str):
     trace.llm_calls.append(LLMCallTrace(
         step=total_steps + 1,
         duration_ms=(perf_counter() - start) * 1000,
@@ -81,7 +83,7 @@ def record_exception_llm_trace(trace: AgentTrace, start: float, total_steps: int
         response_id=None,
         output_types=[],
         success=False,
-        retry_time=retry_time,
+        attempt=attempt,
         error=error
     ))
 
@@ -89,7 +91,7 @@ def record_exception_llm_trace(trace: AgentTrace, start: float, total_steps: int
 def call_llm_with_retry_and_extend_history(history: list[dict[str, str]], total_steps: int, trace: AgentTrace):
     # 检查是否超限
     if total_steps >= MAX_STEPS:
-        raise RuntimeError(f"Agent steps have exceeded limit {MAX_STEPS}")
+        raise LimitExceededError(f"Agent steps have exceeded limit {MAX_STEPS}")
     # 使用对话历史调用LLM并获取响应
     for attempt in range(1, MAX_LLM_RETRIES + 1):
         start = perf_counter()
@@ -141,11 +143,12 @@ def execute_function_calls(history, response, total_tool_calls: int, current_ste
 
         # 额度超限检查
         if total_tool_calls + tool_call_count >= MAX_TOOL_CALLS:
-            raise RuntimeError(f"Agent tool calls have exceeded limit {MAX_TOOL_CALLS}")
+            raise LimitExceededError(f"Agent tool calls have exceeded limit {MAX_TOOL_CALLS}")
         # 进行function call调用
         start = perf_counter()
         tool_name = item.name
         call_id = item.call_id
+        error = None
         try:
             arguments = json.loads(item.arguments)
             if not isinstance(arguments, dict):
@@ -153,11 +156,13 @@ def execute_function_calls(history, response, total_tool_calls: int, current_ste
             logger.info("[Tool Call] %s: %s", tool_name, arguments)
             handler = TOOL_HANDLERS[tool_name]
             result = handler(**arguments)
+            success = True
         except Exception as e:
-            result = {"error": repr(e)}
-            record_tool_call_trace(trace, start, current_step, call_id, tool_name, False, repr(e))
+            error = repr(e)
+            result = {"error": error}
+            success = False
         # 处理function call结果
-        record_tool_call_trace(trace, start, current_step, call_id, tool_name, True, None)
+        record_tool_call_trace(trace, start, current_step, call_id, tool_name, success, error)
         logger.info("[Tool Result] %s", result)
         history.append({
             "type": "function_call_output",
@@ -175,18 +180,30 @@ def agent_loop(user_prompt: str) -> str:
     trace = AgentTrace()
     total_steps = 0
     total_tool_calls = 0
-    while True:
-        # LLM调用
-        response = call_llm_with_retry_and_extend_history(history, total_steps, trace)
-        total_steps += 1
-        # Function Call处理
-        tool_call_count = execute_function_calls(history, response, total_tool_calls, total_steps, trace)
-        total_tool_calls += tool_call_count
-        # 判断正常执行终止
-        if tool_call_count == 0:
-            logger.info("=== Agent Trace ===")
-            logger.info(trace)
-            return response.output_text
+    try:
+        while True:
+            # LLM调用
+            response = call_llm_with_retry_and_extend_history(history, total_steps, trace)
+            total_steps += 1
+            # Function Call处理
+            tool_call_count = execute_function_calls(history, response, total_tool_calls, total_steps, trace)
+            total_tool_calls += tool_call_count
+            # 判断正常执行终止
+            if tool_call_count == 0:
+                trace.status = AgentStatus.COMPLETED
+                return response.output_text
+    except LimitExceededError as e:
+        trace.status = AgentStatus.LIMIT_EXCEEDED
+        trace.error = repr(e)
+        raise
+    except Exception as e:
+        trace.status = AgentStatus.FAILED
+        trace.error = repr(e)
+        raise
+    finally:
+        trace.ended_at = datetime.now(timezone.utc)
+        logger.info("=== Agent Trace ===")
+        logger.info(trace)
 
 
 if __name__ == "__main__":
