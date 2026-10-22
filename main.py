@@ -1,13 +1,17 @@
 import json
 import logging
 from pathlib import Path
+from time import perf_counter
 
 from openai import OpenAI
+from openai.types.responses import Response
 
 from logging_config import setup_logging
+from trace_model import AgentTrace, LLMCallTrace
 
 PROJECT_ROOT = Path.cwd().resolve()
 logger = logging.getLogger(__name__)
+
 
 # Tool Functions
 def list_files(path: str) -> list[str]:
@@ -55,13 +59,25 @@ tools = [
 ]
 
 
-def call_llm_with_retry_and_extend_history(history, total_steps: int):
+def record_llm_trace(trace: AgentTrace, start: float, total_steps: int, response: Response):
+    trace.llm_calls.append(LLMCallTrace(
+        step=total_steps + 1,
+        duration_ms=(perf_counter() - start) * 1000,
+        input_tokens=response.usage.input_tokens if response.usage else None,
+        output_tokens=response.usage.output_tokens if response.usage else None,
+        response_id=response.id,
+        output_types=[item.type for item in response.output]
+    ))
+
+
+def call_llm_with_retry_and_extend_history(history: list[dict[str, str]], total_steps: int, trace: AgentTrace):
     # 检查是否超限
     if total_steps >= MAX_STEPS:
         raise RuntimeError(f"Agent steps have exceeded limit {MAX_STEPS}")
     # 使用对话历史调用LLM并获取响应
     for tries in range(MAX_LLM_RETRIES):
         try:
+            start = perf_counter()
             response = client.responses.create(
                 model="qwen3:8b",
                 instructions=(
@@ -73,6 +89,8 @@ def call_llm_with_retry_and_extend_history(history, total_steps: int):
                 tools=tools,
                 tool_choice="auto"
             )
+            # 记录LLM调用trace
+            record_llm_trace(trace, start, total_steps, response)
             # 响应缓存至对话历史
             history.extend(response.output)
             return response
@@ -118,30 +136,26 @@ def execute_function_calls(history, response, total_tool_calls: int) -> int:
 
 # Main Agent Loop
 def agent_loop(user_prompt: str) -> str:
-    history = [
-        {
-            "role": "user",
-            "content": user_prompt
-        }
-    ]
+    history = [{"role": "user", "content": user_prompt}]
+    trace = AgentTrace()
     total_steps = 0
     total_tool_calls = 0
     while True:
         # LLM调用
-        response = call_llm_with_retry_and_extend_history(history, total_steps)
+        response = call_llm_with_retry_and_extend_history(history, total_steps, trace)
         total_steps += 1
         # Function Call处理
         tool_call_count = execute_function_calls(history, response, total_tool_calls)
         total_tool_calls += tool_call_count
         # 判断正常执行终止
         if tool_call_count == 0:
+            logger.info("=== Agent Trace ===")
+            logger.info(trace)
             return response.output_text
 
 
 if __name__ == "__main__":
     setup_logging()
-
-    user_prompt = "List the my current project working directory."
-    assistant_message = agent_loop(user_prompt)
+    assistant_message = agent_loop("List my current project working directory.")
     logger.info("\n[Agent Response]")
     logger.info(assistant_message)
