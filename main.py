@@ -7,7 +7,7 @@ from openai import OpenAI
 from openai.types.responses import Response
 
 from logging_config import setup_logging
-from trace_model import AgentTrace, LLMCallTrace
+from trace_model import AgentTrace, LLMCallTrace, ToolCallTrace
 
 PROJECT_ROOT = Path.cwd().resolve()
 logger = logging.getLogger(__name__)
@@ -59,14 +59,30 @@ tools = [
 ]
 
 
-def record_llm_trace(trace: AgentTrace, start: float, total_steps: int, response: Response):
+def record_success_llm_trace(trace: AgentTrace, start: float, total_steps: int, response: Response, attempt: int):
     trace.llm_calls.append(LLMCallTrace(
         step=total_steps + 1,
         duration_ms=(perf_counter() - start) * 1000,
         input_tokens=response.usage.input_tokens if response.usage else None,
         output_tokens=response.usage.output_tokens if response.usage else None,
         response_id=response.id,
-        output_types=[item.type for item in response.output]
+        output_types=[item.type for item in response.output],
+        success=True,
+        attempt=attempt
+    ))
+
+
+def record_exception_llm_trace(trace: AgentTrace, start: float, total_steps: int, retry_time: int, error: str):
+    trace.llm_calls.append(LLMCallTrace(
+        step=total_steps + 1,
+        duration_ms=(perf_counter() - start) * 1000,
+        input_tokens=None,
+        output_tokens=None,
+        response_id=None,
+        output_types=[],
+        success=False,
+        retry_time=retry_time,
+        error=error
     ))
 
 
@@ -75,9 +91,9 @@ def call_llm_with_retry_and_extend_history(history: list[dict[str, str]], total_
     if total_steps >= MAX_STEPS:
         raise RuntimeError(f"Agent steps have exceeded limit {MAX_STEPS}")
     # 使用对话历史调用LLM并获取响应
-    for tries in range(MAX_LLM_RETRIES):
+    for attempt in range(1, MAX_LLM_RETRIES + 1):
+        start = perf_counter()
         try:
-            start = perf_counter()
             response = client.responses.create(
                 model="qwen3:8b",
                 instructions=(
@@ -89,18 +105,33 @@ def call_llm_with_retry_and_extend_history(history: list[dict[str, str]], total_
                 tools=tools,
                 tool_choice="auto"
             )
-            # 记录LLM调用trace
-            record_llm_trace(trace, start, total_steps, response)
-            # 响应缓存至对话历史
-            history.extend(response.output)
-            return response
-        # TODO: 应该区分可重试和不可重试异常
+            # TODO: 应该区分可重试和不可重试异常
         except Exception as e:
-            logger.error("Error calling LLM: %s. Retrying: %d/%d", repr(e), tries + 1, MAX_LLM_RETRIES)
+            logger.error("Error calling LLM: %s. Attempt: %d/%d", repr(e), attempt, MAX_LLM_RETRIES)
+            # 记录异常LLM调用trace
+            record_exception_llm_trace(trace, start, total_steps, attempt, repr(e))
+            continue
+        # 记录成功LLM调用trace
+        record_success_llm_trace(trace, start, total_steps, response, attempt)
+        # 响应缓存至对话历史
+        history.extend(response.output)
+        return response
     raise RuntimeError(f"LLM retries have exceeded limit {MAX_LLM_RETRIES}")
 
 
-def execute_function_calls(history, response, total_tool_calls: int) -> int:
+def record_tool_call_trace(trace: AgentTrace, start: float, current_step: int, call_id: str, tool_name: str,
+                           success: bool, error: str | None):
+    trace.tool_calls.append(ToolCallTrace(
+        step=current_step,
+        call_id=call_id,
+        tool_name=tool_name,
+        duration_ms=(perf_counter() - start) * 1000,
+        success=success,
+        error=error
+    ))
+
+
+def execute_function_calls(history, response, total_tool_calls: int, current_step: int, trace: AgentTrace) -> int:
     tool_call_count = 0
     for item in response.output:
         # 非function call的先跳过
@@ -112,8 +143,10 @@ def execute_function_calls(history, response, total_tool_calls: int) -> int:
         if total_tool_calls + tool_call_count >= MAX_TOOL_CALLS:
             raise RuntimeError(f"Agent tool calls have exceeded limit {MAX_TOOL_CALLS}")
         # 进行function call调用
+        start = perf_counter()
+        tool_name = item.name
+        call_id = item.call_id
         try:
-            tool_name = item.name
             arguments = json.loads(item.arguments)
             if not isinstance(arguments, dict):
                 raise ValueError("Tool arguments not an object")
@@ -122,11 +155,13 @@ def execute_function_calls(history, response, total_tool_calls: int) -> int:
             result = handler(**arguments)
         except Exception as e:
             result = {"error": repr(e)}
+            record_tool_call_trace(trace, start, current_step, call_id, tool_name, False, repr(e))
         # 处理function call结果
+        record_tool_call_trace(trace, start, current_step, call_id, tool_name, True, None)
         logger.info("[Tool Result] %s", result)
         history.append({
             "type": "function_call_output",
-            "call_id": item.call_id,
+            "call_id": call_id,
             "output": json.dumps(result, ensure_ascii=False)
         })
         tool_call_count += 1
@@ -145,7 +180,7 @@ def agent_loop(user_prompt: str) -> str:
         response = call_llm_with_retry_and_extend_history(history, total_steps, trace)
         total_steps += 1
         # Function Call处理
-        tool_call_count = execute_function_calls(history, response, total_tool_calls)
+        tool_call_count = execute_function_calls(history, response, total_tool_calls, total_steps, trace)
         total_tool_calls += tool_call_count
         # 判断正常执行终止
         if tool_call_count == 0:
