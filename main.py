@@ -7,8 +7,10 @@ from time import perf_counter
 from openai import OpenAI
 from openai.types.responses import Response
 
+from context_manager import ContextManager, ContextBudget
 from exception import LimitExceededError
 from logging_config import setup_logging
+from session import AgentSession
 from trace_model import AgentTrace, LLMCallTrace, ToolCallTrace, AgentStatus
 
 PROJECT_ROOT = Path.cwd().resolve()
@@ -36,6 +38,10 @@ TOOL_HANDLERS = {
 MAX_STEPS = 10
 MAX_TOOL_CALLS = 10
 MAX_LLM_RETRIES = 3
+MAX_CONTEXT_TOKEN_LEN = 16384
+RESERVED_OUTPUT_TOKEN_LEN = 2048
+COMPACTION_RATIO = 0.8
+
 client = OpenAI(
     base_url="http://localhost:11434/v1/",
     api_key="ollama"
@@ -88,7 +94,7 @@ def record_exception_llm_trace(trace: AgentTrace, start: float, total_steps: int
     ))
 
 
-def call_llm_with_retry_and_extend_history(history: list[dict[str, str]], total_steps: int, trace: AgentTrace):
+def call_llm_with_retry_and_extend_history(session: AgentSession, total_steps: int, trace: AgentTrace):
     # 检查是否超限
     if total_steps >= MAX_STEPS:
         raise LimitExceededError(f"Agent steps have exceeded limit {MAX_STEPS}")
@@ -97,13 +103,13 @@ def call_llm_with_retry_and_extend_history(history: list[dict[str, str]], total_
         start = perf_counter()
         try:
             response = client.responses.create(
-                model="qwen3:8b",
+                model="mini-qwen3-16k",
                 instructions=(
                     "You are a coding assistant. "
                     "Use tools when you need information about the project. "
                     "Do not invent file names."
                 ),
-                input=history,
+                input=session.get_history(),
                 tools=tools,
                 tool_choice="auto"
             )
@@ -116,7 +122,7 @@ def call_llm_with_retry_and_extend_history(history: list[dict[str, str]], total_
         # 记录成功LLM调用trace
         record_success_llm_trace(trace, start, total_steps, response, attempt)
         # 响应缓存至对话历史
-        history.extend(response.output)
+        session.append(response.output)
         return response
     raise RuntimeError(f"LLM retries have exceeded limit {MAX_LLM_RETRIES}")
 
@@ -133,7 +139,7 @@ def record_tool_call_trace(trace: AgentTrace, start: float, current_step: int, c
     ))
 
 
-def execute_function_calls(history, response, total_tool_calls: int, current_step: int, trace: AgentTrace) -> int:
+def execute_function_calls(session: AgentSession, response, total_tool_calls: int, current_step: int, trace: AgentTrace) -> int:
     tool_call_count = 0
     for item in response.output:
         # 非function call的先跳过
@@ -164,11 +170,11 @@ def execute_function_calls(history, response, total_tool_calls: int, current_ste
         # 处理function call结果
         record_tool_call_trace(trace, start, current_step, call_id, tool_name, success, error)
         logger.info("[Tool Result] %s", result)
-        history.append({
+        session.append([{
             "type": "function_call_output",
             "call_id": call_id,
             "output": json.dumps(result, ensure_ascii=False)
-        })
+        }])
         tool_call_count += 1
 
     return tool_call_count
@@ -176,17 +182,28 @@ def execute_function_calls(history, response, total_tool_calls: int, current_ste
 
 # Main Agent Loop
 def agent_loop(user_prompt: str) -> str:
-    history = [{"role": "user", "content": user_prompt}]
+    context_budget = ContextBudget(
+        max_context_tokens=MAX_CONTEXT_TOKEN_LEN,
+        reserved_output_tokens=RESERVED_OUTPUT_TOKEN_LEN
+    )
+    context_manager = ContextManager(
+        context_budget=context_budget,
+        compaction_ratio=COMPACTION_RATIO
+    )
+    session = AgentSession(context_manager)
+    session.append([{"role": "user", "content": user_prompt}])
     trace = AgentTrace()
     total_steps = 0
     total_tool_calls = 0
     try:
         while True:
+            if session.should_compact():
+                raise LimitExceededError("Context compaction not yet implemented!")
             # LLM调用
-            response = call_llm_with_retry_and_extend_history(history, total_steps, trace)
+            response = call_llm_with_retry_and_extend_history(session, total_steps, trace)
             total_steps += 1
             # Function Call处理
-            tool_call_count = execute_function_calls(history, response, total_tool_calls, total_steps, trace)
+            tool_call_count = execute_function_calls(session, response, total_tool_calls, total_steps, trace)
             total_tool_calls += tool_call_count
             # 判断正常执行终止
             if tool_call_count == 0:

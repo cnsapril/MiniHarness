@@ -12,7 +12,11 @@ class AgentSession:
     def append(self, items: list):
         deep_copy_items = deepcopy(items)
         self._history.extend(deep_copy_items)
-        self.context_manager.invalidate()
+        try:
+            self.context_manager.append(self._history, deep_copy_items)
+        except Exception:
+            self.context_manager.invalidate()
+            raise
 
     def replace_history(self, new_history: list):
         deep_copy_new_history = deepcopy(new_history)

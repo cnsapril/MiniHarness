@@ -7,13 +7,13 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ContextBudget:
-    max_content_tokens: int
+    max_context_tokens: int
     reserved_output_tokens: int
     safety_margin_tokens: int = 1024
 
     @property
     def available_input_tokens(self) -> int:
-        return self.max_content_tokens - self.reserved_output_tokens - self.safety_margin_tokens
+        return self.max_context_tokens - self.reserved_output_tokens - self.safety_margin_tokens
 
 
 class ContextManager:
@@ -42,11 +42,11 @@ class ContextManager:
     def invalidate(self):
         self._cached_tokens = None
 
-    def append(self, prev_history: list, new_items: list):
+    def append(self, full_history: list, new_items: list):
         estimated_tokens = self.estimate_tokens(new_items)
         if self._cached_tokens is None:
             # cache miss，需要重新建立baseline
-            self._cached_tokens = self.estimate_tokens(prev_history) + estimated_tokens
+            self._cached_tokens = self.estimate_tokens(full_history)
         else:
             self._cached_tokens += estimated_tokens
 
