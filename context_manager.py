@@ -5,6 +5,26 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 
+class ContextHelper:
+    @staticmethod
+    def serialize_items(items: list) -> str:
+        # 尝试使用模型API将模型响应进行序列化
+        serializable = [item.model_dump(mode="json") if hasattr(item, "model_dump")
+                        else item
+                        for item in items]
+        return json.dumps(serializable, ensure_ascii=False)
+
+    @staticmethod
+    def estimate_tokens_str(content: str) -> int:
+        return len(content) // 3
+
+    @staticmethod
+    def estimate_tokens(items: list) -> int:
+        content = ContextHelper.serialize_items(items)
+        # TODO: 目前只是估算，后续需要用模型tokenizer进行纠偏
+        return ContextHelper.estimate_tokens_str(content)
+
+
 @dataclass(frozen=True)
 class ContextBudget:
     max_context_tokens: int
@@ -23,30 +43,22 @@ class ContextManager:
         self._cached_tokens: int | None = None
         self.compaction_ratio = compaction_ratio
 
-    @staticmethod
-    def estimate_tokens(items: list) -> int:
-        # 尝试使用模型API将模型响应进行序列化
-        serializable = [item.model_dump(mode="json") if hasattr(item, "model_dump")
-                        else item
-                        for item in items]
-        content = json.dumps(serializable, ensure_ascii=False)
-        # TODO: 目前只是估算，后续需要用模型tokenizer进行纠偏
-        return len(content) // 3
+    def get_compaction_threshold(self):
+        return int(self.compaction_ratio * self.context_budget.available_input_tokens)
 
     def should_compact(self, history: list) -> bool:
         if self._cached_tokens is None:
-            self._cached_tokens = self.estimate_tokens(history)
-        threshold = self.compaction_ratio * self.context_budget.available_input_tokens
-        return self._cached_tokens >= int(threshold)
+            self._cached_tokens = ContextHelper.estimate_tokens(history)
+        return self._cached_tokens >= self.get_compaction_threshold()
 
     def invalidate(self):
         self._cached_tokens = None
 
     def append(self, full_history: list, new_items: list):
-        estimated_tokens = self.estimate_tokens(new_items)
+        estimated_tokens = ContextHelper.estimate_tokens(new_items)
         if self._cached_tokens is None:
             # cache miss，需要重新建立baseline
-            self._cached_tokens = self.estimate_tokens(full_history)
+            self._cached_tokens = ContextHelper.estimate_tokens(full_history)
         else:
             self._cached_tokens += estimated_tokens
 
@@ -54,4 +66,4 @@ class ContextManager:
         # TODO: implement
         logger.info("Compaction executed")
         self.invalidate()
-        self._cached_tokens = self.estimate_tokens(new_history)
+        self._cached_tokens = ContextHelper.estimate_tokens(new_history)

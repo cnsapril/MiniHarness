@@ -7,6 +7,7 @@ from time import perf_counter
 from openai import OpenAI
 from openai.types.responses import Response
 
+from compactor import compact_session
 from context_manager import ContextManager, ContextBudget
 from exception import LimitExceededError
 from logging_config import setup_logging
@@ -40,7 +41,7 @@ MAX_TOOL_CALLS = 10
 MAX_LLM_RETRIES = 3
 MAX_CONTEXT_TOKEN_LEN = 16384
 RESERVED_OUTPUT_TOKEN_LEN = 2048
-COMPACTION_RATIO = 0.8
+COMPACTION_RATIO = 0.1
 
 client = OpenAI(
     base_url="http://localhost:11434/v1/",
@@ -197,8 +198,9 @@ def agent_loop(user_prompt: str) -> str:
     total_tool_calls = 0
     try:
         while True:
+            # 处理上下文压缩
             if session.should_compact():
-                raise LimitExceededError("Context compaction not yet implemented!")
+                compact_session(session, client)
             # LLM调用
             response = call_llm_with_retry_and_extend_history(session, total_steps, trace)
             total_steps += 1

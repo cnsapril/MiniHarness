@@ -29,8 +29,14 @@ class AgentSession:
     def get_history(self) -> list:
         return deepcopy(self._history)
 
+    def get_step_ends(self) -> list[int]:
+        return self._completed_step_ends.copy()
+
     def should_compact(self) -> bool:
         return self.context_manager.should_compact(self._history)
+
+    def get_compaction_threshold(self) -> int:
+        return self.context_manager.get_compaction_threshold()
 
     def mark_step_complete(self):
         # 记录当前完整Step在History中的结束位置
