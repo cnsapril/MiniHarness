@@ -205,6 +205,8 @@ def agent_loop(user_prompt: str) -> str:
             # Function Call处理
             tool_call_count = execute_function_calls(session, response, total_tool_calls, total_steps, trace)
             total_tool_calls += tool_call_count
+            # 记录Context Safe Boundary
+            session.mark_step_complete()
             # 判断正常执行终止
             if tool_call_count == 0:
                 trace.status = AgentStatus.COMPLETED
