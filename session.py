@@ -2,6 +2,7 @@ from copy import deepcopy
 
 from context_manager import ContextManager
 from sqlite_execution_log import SQLiteExecutionLog
+from tool_model import ToolInteraction
 
 
 class AgentSession:
@@ -55,6 +56,17 @@ class AgentSession:
         self._history.extend(deep_copy_items)
         try:
             self.context_manager.append(self._history, deep_copy_items)
+        except Exception:
+            self.context_manager.invalidate()
+            raise
+
+    def record_tool_interaction(self, interaction: ToolInteraction) -> None:
+        """Persist a completed interaction before updating working context."""
+        output_item = deepcopy(interaction.output)
+        self.execution_log.append_tool_interaction(interaction)
+        self._history.append(output_item)
+        try:
+            self.context_manager.append(self._history, [output_item])
         except Exception:
             self.context_manager.invalidate()
             raise
