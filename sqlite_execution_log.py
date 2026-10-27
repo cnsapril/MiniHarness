@@ -28,6 +28,16 @@ class SQLiteExecutionLog:
             CREATE INDEX IF NOT EXISTS idx_context_snapshot
             ON events(session_id, kind, id);
         """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS tool_interactions (
+                session_id TEXT NOT NULL,
+                call_id TEXT NOT NULL,
+                event_id INTEGER NOT NULL,
+                payload TEXT NOT NULL,
+                PRIMARY KEY (session_id, call_id),
+                FOREIGN KEY (event_id) REFERENCES events(id)
+            )
+        """)
         self.conn.commit()
 
     def get_session_id(self) -> str:
@@ -61,22 +71,14 @@ class SQLiteExecutionLog:
         return self.serialize_return_rows(rows)
 
     def get_snapshots_for_recovery(self) -> list[dict]:
-        with self.conn:
-            recovery_snapshot_id = self.conn.execute("""
-                SELECT id FROM events
-                WHERE session_id = ? AND kind = 'context_replaced'
-                ORDER BY id DESC LIMIT 1
-            """, (self.session_id,)).fetchone()
-            if recovery_snapshot_id is None:
-                # 没有Snapshot来recover，只能返回全量history
-                return self.get_events()
-            # 返回最新的Snapshot和后续增量history
-            rows = self.conn.execute("""
-                SELECT kind, payload FROM events
-                WHERE session_id = ? AND id >= ?
-                ORDER BY id ASC
-            """, (self.session_id, recovery_snapshot_id[0])).fetchall()
-            return self.serialize_return_rows(rows)
+        rows = self.conn.execute("""
+            SELECT kind, payload FROM events
+            WHERE session_id = ?
+            AND id >= COALESCE((
+                SELECT MAX(id) FROM events WHERE session_id = ? AND kind = 'context_replaced'
+            ),0) ORDER BY id ASC
+        """, (self.session_id, self.session_id)).fetchall()
+        return self.serialize_return_rows(rows)
 
     def close(self):
         self.conn.close()

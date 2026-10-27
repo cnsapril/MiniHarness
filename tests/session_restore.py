@@ -17,6 +17,12 @@ with tempfile.TemporaryDirectory() as directory:
         ContextBudget(16384, 2048), 0.8
     )
     session1 = AgentSession(manager1, log1)
+    session1.append([
+        {
+            "role": "user",
+            "content": "Analyze my project files"
+        }
+    ])
     # 构造 5 个完整 Steps
     for i in range(5):
         if i == 0:
@@ -51,7 +57,6 @@ with tempfile.TemporaryDirectory() as directory:
     session1.append([
         {"role": "user", "content": "List project files"}
     ])
-    session1.mark_step_complete()
     expected_history = session1.get_history()
     expected_ends = session1.get_step_ends()
     log1.close()

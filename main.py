@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
-from uuid import UUID
+from uuid import uuid4
 
 from openai import OpenAI
 from openai.types.responses import Response
@@ -11,7 +11,6 @@ from openai.types.responses import Response
 from compactor import compact_session
 from context_manager import ContextManager, ContextBudget
 from exception import LimitExceededError
-from execution_log import ExecutionLog
 from logging_config import setup_logging
 from session import AgentSession
 from sqlite_execution_log import SQLiteExecutionLog
@@ -196,7 +195,7 @@ def agent_loop(user_prompt: str) -> str:
         context_budget=context_budget,
         compaction_ratio=COMPACTION_RATIO
     )
-    execution_log = SQLiteExecutionLog(DB_PATH, str(UUID()))
+    execution_log = SQLiteExecutionLog(DB_PATH, str(uuid4()))
     session = AgentSession(context_manager, execution_log)
     session.append([{"role": "user", "content": user_prompt}])
     trace = AgentTrace()

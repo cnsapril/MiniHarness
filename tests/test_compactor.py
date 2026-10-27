@@ -1,7 +1,7 @@
 import unittest
 from unittest import TestCase
 from unittest.mock import Mock
-from uuid import UUID
+from uuid import uuid4
 
 from compactor import compact_session
 from context_manager import ContextBudget, ContextManager, ContextHelper
@@ -69,7 +69,7 @@ class CompactorTest(TestCase):
             reserved_output_tokens=2048
         )
         manager = ContextManager(budget, 0.8)
-        execution_log = SQLiteExecutionLog(DB_PATH, str(UUID()))
+        execution_log = SQLiteExecutionLog(DB_PATH, str(uuid4()))
         session = AgentSession(manager, execution_log)
         session.append([
             {"role": "user", "content": "List project files"}
@@ -131,7 +131,7 @@ class CompactorTest(TestCase):
             reserved_output_tokens=2048
         )
         manager = ContextManager(budget, 0.8)
-        execution_log = SQLiteExecutionLog(DB_PATH, str(UUID()))
+        execution_log = SQLiteExecutionLog(DB_PATH, str(uuid4()))
         session = AgentSession(manager, execution_log)
         session.append([
             {"role": "user", "content": "List project files"}

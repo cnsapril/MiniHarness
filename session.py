@@ -17,8 +17,9 @@ class AgentSession:
             elif item["kind"] == "step_completed":
                 # 处理step end replay
                 end = item["end"]
-                if not 0 < end <= len(session.get_history()):
-                    raise ValueError(f"Restoring step end {end} out of range")
+                last_end = session._completed_step_ends[-1] if session._completed_step_ends else 0
+                if not last_end < end <= len(session._history):
+                    raise ValueError(f"Invalid restored step boundary: {end}" )
                 session._replay_step_end(end)
             elif item["kind"] == "history_items":
                 # 处理历史消息replay
