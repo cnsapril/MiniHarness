@@ -4,6 +4,7 @@ from unittest.mock import Mock
 
 from compactor import compact_session
 from context_manager import ContextBudget, ContextManager, ContextHelper
+from execution_log import ExecutionLog
 from session import AgentSession
 
 
@@ -16,7 +17,8 @@ class CompactorTest(TestCase):
             reserved_output_tokens=2048
         )
         manager = ContextManager(budget, 0.8)
-        session = AgentSession(manager)
+        execution_log = ExecutionLog()
+        session = AgentSession(manager, execution_log)
         session.append([
             {"role": "user", "content": "List project files"}
         ])
@@ -64,7 +66,8 @@ class CompactorTest(TestCase):
             reserved_output_tokens=2048
         )
         manager = ContextManager(budget, 0.8)
-        session = AgentSession(manager)
+        execution_log = ExecutionLog()
+        session = AgentSession(manager, execution_log)
         session.append([
             {"role": "user", "content": "List project files"}
         ])
@@ -100,9 +103,9 @@ class CompactorTest(TestCase):
         compact_session(session, client)
 
         # Assert 1: History 长度
-        self.assertEqual(len(session.get_history()),6)
+        self.assertEqual(len(session.get_history()), 6)
         # Assert 2: Step Boundaries
-        self.assertEqual(session.get_step_ends(),[4, 6])
+        self.assertEqual(session.get_step_ends(), [4, 6])
         # Assert 3: Pinned User Prompt 保持不变
         self.assertEqual(history_before[0], session.get_history()[0])
         # Assert 4: 最近两个 Steps 的内容保持不变
@@ -125,7 +128,8 @@ class CompactorTest(TestCase):
             reserved_output_tokens=2048
         )
         manager = ContextManager(budget, 0.8)
-        session = AgentSession(manager)
+        execution_log = ExecutionLog()
+        session = AgentSession(manager, execution_log)
         session.append([
             {"role": "user", "content": "List project files"}
         ])
@@ -164,6 +168,7 @@ class CompactorTest(TestCase):
 
         # Verify: LLM没有被调用
         client.responses.create.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

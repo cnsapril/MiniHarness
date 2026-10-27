@@ -1,17 +1,20 @@
 from copy import deepcopy
 
 from context_manager import ContextManager
+from execution_log import ExecutionLog
 
 
 class AgentSession:
 
-    def __init__(self, context_manager: ContextManager):
+    def __init__(self, context_manager: ContextManager, execution_log: ExecutionLog):
         self.context_manager = context_manager
+        self.execution_log = execution_log
         self._history = []
         self._completed_step_ends: list[int] = []
 
     def append(self, items: list):
         deep_copy_items = deepcopy(items)
+        self.execution_log.append_items(deep_copy_items)
         self._history.extend(deep_copy_items)
         try:
             self.context_manager.append(self._history, deep_copy_items)

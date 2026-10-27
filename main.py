@@ -10,6 +10,7 @@ from openai.types.responses import Response
 from compactor import compact_session
 from context_manager import ContextManager, ContextBudget
 from exception import LimitExceededError
+from execution_log import ExecutionLog
 from logging_config import setup_logging
 from session import AgentSession
 from trace_model import AgentTrace, LLMCallTrace, ToolCallTrace, AgentStatus
@@ -140,7 +141,8 @@ def record_tool_call_trace(trace: AgentTrace, start: float, current_step: int, c
     ))
 
 
-def execute_function_calls(session: AgentSession, response, total_tool_calls: int, current_step: int, trace: AgentTrace) -> int:
+def execute_function_calls(session: AgentSession, response, total_tool_calls: int, current_step: int,
+                           trace: AgentTrace) -> int:
     tool_call_count = 0
     for item in response.output:
         # 非function call的先跳过
@@ -191,7 +193,8 @@ def agent_loop(user_prompt: str) -> str:
         context_budget=context_budget,
         compaction_ratio=COMPACTION_RATIO
     )
-    session = AgentSession(context_manager)
+    execution_log = ExecutionLog()
+    session = AgentSession(context_manager, execution_log)
     session.append([{"role": "user", "content": user_prompt}])
     trace = AgentTrace()
     total_steps = 0

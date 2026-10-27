@@ -1,5 +1,5 @@
-from datetime import datetime, timezone
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 
 
@@ -8,6 +8,7 @@ class AgentStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     LIMIT_EXCEEDED = "limit_exceeded"
+
 
 @dataclass
 class LLMCallTrace:
@@ -21,6 +22,7 @@ class LLMCallTrace:
     attempt: int
     error: str | None = None
 
+
 @dataclass
 class ToolCallTrace:
     step: int
@@ -29,6 +31,7 @@ class ToolCallTrace:
     duration_ms: float
     success: bool
     error: str | None = None
+
 
 @dataclass
 class AgentTrace:
