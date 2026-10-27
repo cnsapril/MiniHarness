@@ -57,6 +57,10 @@ def summarize_history(client: OpenAI, old_history: list) -> str:
         max_output_tokens=SUMMARY_MAX_OUTPUT_TOKENS,
         extra_body={"think": False}
     )
+    # 校验模型是否完整生成summary
+    if response.status and response.status != "completed":
+        raise ValueError(f"Compaction response incomplete: {response.status}, {response.incomplete_details}")
+    # 提取summary
     summary = response.output_text.strip()
     if not summary:
         raise ValueError("Compaction produced empty summary")
