@@ -15,6 +15,7 @@ from logging_config import setup_logging
 from session import AgentSession
 from sqlite_execution_log import SQLiteExecutionLog
 from trace_model import AgentTrace, LLMCallTrace, ToolCallTrace, AgentStatus
+from tool_model import ToolInteraction
 
 PROJECT_ROOT = Path.cwd().resolve()
 logger = logging.getLogger(__name__)
@@ -175,11 +176,17 @@ def execute_function_calls(session: AgentSession, response, total_tool_calls: in
         # 处理function call结果
         record_tool_call_trace(trace, start, current_step, call_id, tool_name, success, error)
         logger.info("[Tool Result] %s", result)
-        session.append([{
+        output_item = {
             "type": "function_call_output",
             "call_id": call_id,
             "output": json.dumps(result, ensure_ascii=False)
-        }])
+        }
+        interaction = ToolInteraction(
+            call_id=call_id,
+            input=item.model_dump(mode="json"),
+            output=output_item
+        )
+        session.record_tool_interaction(interaction)
         tool_call_count += 1
 
     return tool_call_count

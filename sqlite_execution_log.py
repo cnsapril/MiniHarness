@@ -2,6 +2,7 @@ import json
 import sqlite3
 
 from context_manager import ContextHelper
+from tool_model import ToolInteraction
 
 
 class SQLiteExecutionLog:
@@ -11,6 +12,7 @@ class SQLiteExecutionLog:
 
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=FULL")
+        self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -54,6 +56,31 @@ class SQLiteExecutionLog:
     def append_items(self, items: list):
         serializable = ContextHelper.serialize_items(items)
         self.append_event("history_items", {"items": serializable})
+
+    def append_tool_interaction(self, interaction: ToolInteraction) -> None:
+        """Atomically journal the tool output and index the complete call/result pair."""
+        payload = interaction.to_payload()
+        with self.conn:
+            cursor = self.conn.execute(
+                "INSERT INTO events(session_id, kind, payload) VALUES (?, ?, ?)",
+                (self.session_id, "history_items",
+                 json.dumps({"items": [payload["output"]]}, ensure_ascii=False))
+            )
+            self.conn.execute(
+                "INSERT INTO tool_interactions(session_id, call_id, event_id, payload) VALUES (?, ?, ?, ?)",
+                (self.session_id, interaction.call_id, cursor.lastrowid,
+                 json.dumps(payload, ensure_ascii=False))
+            )
+
+    def get_tool_interaction(self, call_id: str) -> ToolInteraction | None:
+        row = self.conn.execute(
+            "SELECT payload FROM tool_interactions WHERE session_id = ? AND call_id = ?",
+            (self.session_id, call_id)
+        ).fetchone()
+        if row is None:
+            return None
+        payload = json.loads(row[0])
+        return ToolInteraction(call_id=call_id, input=payload["input"], output=payload["output"])
 
     def append_step_complete(self, end: int):
         self.append_event("step_completed", {"end": end})
