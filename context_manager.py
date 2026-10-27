@@ -1,5 +1,6 @@
 import json
 import logging
+from copy import deepcopy
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -7,11 +8,18 @@ logger = logging.getLogger(__name__)
 
 class ContextHelper:
     @staticmethod
-    def serialize_items(items: list) -> str:
+    def serialize_items(items: list) -> list:
         # 尝试使用模型API将模型响应进行序列化
-        serializable = [item.model_dump(mode="json") if hasattr(item, "model_dump")
-                        else item
-                        for item in items]
+        return [
+            item.model_dump(mode="json")
+            if hasattr(item, "model_dump")
+            else deepcopy(item)
+            for item in items
+        ]
+
+    @staticmethod
+    def serialize_items_to_str(items: list) -> str:
+        serializable = ContextHelper.serialize_items(items)
         return json.dumps(serializable, ensure_ascii=False)
 
     @staticmethod
@@ -20,7 +28,7 @@ class ContextHelper:
 
     @staticmethod
     def estimate_tokens(items: list) -> int:
-        content = ContextHelper.serialize_items(items)
+        content = ContextHelper.serialize_items_to_str(items)
         # TODO: 目前只是估算，后续需要用模型tokenizer进行纠偏
         return ContextHelper.estimate_tokens_str(content)
 

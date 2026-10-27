@@ -3,6 +3,7 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
+from uuid import UUID
 
 from openai import OpenAI
 from openai.types.responses import Response
@@ -13,6 +14,7 @@ from exception import LimitExceededError
 from execution_log import ExecutionLog
 from logging_config import setup_logging
 from session import AgentSession
+from sqlite_execution_log import SQLiteExecutionLog
 from trace_model import AgentTrace, LLMCallTrace, ToolCallTrace, AgentStatus
 
 PROJECT_ROOT = Path.cwd().resolve()
@@ -43,6 +45,7 @@ MAX_LLM_RETRIES = 3
 MAX_CONTEXT_TOKEN_LEN = 16384
 RESERVED_OUTPUT_TOKEN_LEN = 2048
 COMPACTION_RATIO = 0.8
+DB_PATH = "./sqlite_execution_log.db"
 
 client = OpenAI(
     base_url="http://localhost:11434/v1/",
@@ -193,7 +196,7 @@ def agent_loop(user_prompt: str) -> str:
         context_budget=context_budget,
         compaction_ratio=COMPACTION_RATIO
     )
-    execution_log = ExecutionLog()
+    execution_log = SQLiteExecutionLog(DB_PATH, str(UUID()))
     session = AgentSession(context_manager, execution_log)
     session.append([{"role": "user", "content": user_prompt}])
     trace = AgentTrace()

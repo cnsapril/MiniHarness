@@ -1,4 +1,5 @@
 import json
+from uuid import UUID
 
 from compactor import compact_session
 from context_manager import (
@@ -6,15 +7,15 @@ from context_manager import (
     ContextManager,
     ContextHelper,
 )
-from execution_log import ExecutionLog
 from main import client
 from session import AgentSession
+from sqlite_execution_log import SQLiteExecutionLog
 
 manager = ContextManager(
     ContextBudget(16384, 2048),
     compaction_ratio=0.8
 )
-execution_log = ExecutionLog()
+execution_log = SQLiteExecutionLog("tests/e2e_sqlite_execution_log.db", str(UUID()))
 session = AgentSession(manager, execution_log)
 
 session.append([{

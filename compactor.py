@@ -34,7 +34,7 @@ Rules:
 def summarize_history(client: OpenAI, old_history: list) -> str:
     if not old_history:
         raise ValueError("Nothing to compact!")
-    serialized = ContextHelper.serialize_items(old_history)
+    serialized = ContextHelper.serialize_items_to_str(old_history)
     before_token_size = ContextHelper.estimate_tokens_str(serialized)
     if before_token_size >= COMPACTION_MAX_INPUT_TOKENS:
         raise ValueError(f"Estimated compaction token size {before_token_size} exceeds "
