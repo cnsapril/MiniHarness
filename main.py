@@ -1,7 +1,6 @@
 import argparse
 import logging
 from datetime import datetime, timezone
-from pathlib import Path
 from time import perf_counter
 from uuid import uuid4
 
@@ -15,38 +14,11 @@ from logging_config import setup_logging
 from session import AgentSession
 from sqlite_execution_log import SQLiteExecutionLog
 from trace_model import AgentTrace, LLMCallTrace, ToolCallTrace, AgentStatus
-from tool_execution import (
-    RecoveryInspector,
-    ToolExecutionManager,
-    ToolSafety,
-    UnknownToolOutcomeError,
-)
+from tool_execution import RecoveryInspector, ToolExecutionManager, UnknownToolOutcomeError
+from tool_registry import default_tool_registry
 
-PROJECT_ROOT = Path.cwd().resolve()
 logger = logging.getLogger(__name__)
-
-
-# Tool Functions
-def list_files(path: str) -> list[str]:
-    target = (PROJECT_ROOT / path).resolve()
-
-    if not target.is_relative_to(PROJECT_ROOT):
-        raise PermissionError("Path outside project root")
-
-    if not target.is_dir():
-        raise NotADirectoryError(path)
-
-    return sorted(item.name for item in target.iterdir())
-
-
-TOOL_HANDLERS = {
-    "list_files": list_files
-}
-
-# Tool safety is trusted local configuration, not a model-provided hint.
-TOOL_SAFETY = {
-    "list_files": ToolSafety.READ_ONLY,
-}
+registry = default_tool_registry()
 
 # Initializations
 MAX_STEPS = 10
@@ -61,25 +33,7 @@ client = OpenAI(
     base_url="http://localhost:11434/v1/",
     api_key="ollama"
 )
-tools = [
-    {
-        "type": "function",
-        "name": "list_files",
-        "description": "List files and directories under a given path.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Relative directory path, e.g. '.' or 'src'"
-                }
-            },
-            "required": ["path"],
-            "additionalProperties": False
-        },
-        "strict": True
-    }
-]
+tools = registry.llm_schemas()
 
 
 def record_success_llm_trace(trace: AgentTrace, start: float, total_steps: int, response: Response, attempt: int):
@@ -143,20 +97,19 @@ def call_llm_with_retry_and_extend_history(session: AgentSession, total_steps: i
 
 
 def record_tool_call_trace(trace: AgentTrace, start: float, current_step: int, call_id: str, tool_name: str,
-                           success: bool, error: str | None):
+                           handler_returned_normally: bool, error: str | None):
     trace.tool_calls.append(ToolCallTrace(
         step=current_step,
         call_id=call_id,
         tool_name=tool_name,
         duration_ms=(perf_counter() - start) * 1000,
-        success=success,
+        handler_returned_normally=handler_returned_normally,
         error=error
     ))
 
 
-def execute_function_calls(session: AgentSession, response, total_tool_calls: int, current_step: int,
-                           trace: AgentTrace) -> int:
-    executor = ToolExecutionManager(session.execution_log, TOOL_SAFETY)
+def execute_function_calls(session: AgentSession, executor: ToolExecutionManager, response,
+                           total_tool_calls: int, current_step: int, trace: AgentTrace) -> int:
     tool_call_count = 0
     for item in response.output:
         if item.type != "function_call":
@@ -171,14 +124,17 @@ def execute_function_calls(session: AgentSession, response, total_tool_calls: in
         call_id = item.call_id
         logger.info("[Tool Call] %s: %s", tool_name, item.arguments)
         try:
-            outcome = executor.execute(session, item, TOOL_HANDLERS.get(tool_name))
+            outcome = executor.execute(item)
+            # Session owns the atomic Tool Result + Ledger write and Context update.
+            session.record_tool_interaction(outcome.interaction)
+            executor.mark_result_recorded(call_id)
         except UnknownToolOutcomeError as exc:
             # Do not turn an uncertain external outcome into a normal tool error.
             record_tool_call_trace(trace, start, current_step, call_id, tool_name, False, repr(exc))
             raise
 
         record_tool_call_trace(trace, start, current_step, call_id,
-                               tool_name, outcome.success, outcome.error)
+                               tool_name, outcome.handler_returned_normally, outcome.error)
         logger.info("[Tool Result] %s", outcome.result)
         tool_call_count += 1
 
@@ -197,6 +153,7 @@ def agent_loop(user_prompt: str) -> str:
     )
     execution_log = SQLiteExecutionLog(DB_PATH, str(uuid4()))
     session = AgentSession(context_manager, execution_log)
+    executor = ToolExecutionManager(execution_log, registry)
     logger.info("[Session ID] %s", execution_log.get_session_id())
     trace = AgentTrace()
     total_steps = 0
@@ -209,9 +166,14 @@ def agent_loop(user_prompt: str) -> str:
                 compact_session(session, client)
             # LLM调用
             response = call_llm_with_retry_and_extend_history(session, total_steps, trace)
+            # The response has been durably recorded by AgentSession; now register
+            # its tool calls in the per-session runtime before any execution.
+            executor.register_recorded_calls(response.output)
             total_steps += 1
             # Function Call处理
-            tool_call_count = execute_function_calls(session, response, total_tool_calls, total_steps, trace)
+            tool_call_count = execute_function_calls(
+                session, executor, response, total_tool_calls, total_steps, trace
+            )
             total_tool_calls += tool_call_count
             # 记录Context Safe Boundary
             session.mark_step_complete()

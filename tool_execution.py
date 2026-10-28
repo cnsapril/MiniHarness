@@ -4,23 +4,18 @@ This module does not automatically resume sessions or retry side-effecting tools
 """
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Callable
 
 from context_manager import ContextHelper
 from tool_model import ToolInteraction
+from tool_registry import ToolRegistry, ToolSafety
 
 
 class ToolPhase(str, Enum):
     RECORDED = "RECORDED"
     STARTED = "STARTED"
     RESULT_RECORDED = "RESULT_RECORDED"
-
-
-class ToolSafety(str, Enum):
-    READ_ONLY = "READ_ONLY"
-    SIDE_EFFECTING = "SIDE_EFFECTING"
 
 
 class UnsafeToolRetryError(RuntimeError):
@@ -115,71 +110,118 @@ class RecoveryInspector:
 
 
 @dataclass(frozen=True)
-class ToolExecutionResult:
+class ToolExecutionOutcome:
+    """A prepared result, NOT a persisted interaction or a business success."""
+    interaction: ToolInteraction
     result: object
-    success: bool
+    handler_returned_normally: bool
     error: str | None
 
 
 class ToolExecutionManager:
-    def __init__(self, execution_log, tool_safety: dict[str, ToolSafety]):
-        self.execution_log = execution_log
-        self.tool_safety = tool_safety
+    """Per-session execution runtime; AgentSession persists prepared results.
 
-    def execute(self, session, tool_call, handler: Callable | None, *, retry: bool = False) -> ToolExecutionResult:
-        """Run an already-durably-recorded tool call. Retry requires explicit opt-in."""
+    At construction, a single recovery replay establishes known call states.
+    The normal hot path only touches in-memory states and an indexed ledger lookup.
+    """
+
+    def __init__(self, execution_log, registry: ToolRegistry):
+        self.execution_log = execution_log
+        self.registry = registry
+        report = RecoveryInspector(execution_log).inspect()
+        self._calls = {call.call_id: call for call in report.calls}
+
+    def register_recorded_calls(self, items: list) -> None:
+        """Register LLM tool requests AFTER AgentSession.append() commits them.
+
+        Never invoke handlers if writing the LLM response to the log fails.
+        """
+        new_calls = {}
+        for item in ContextHelper.serialize_items(items):
+            if item.get("type") != "function_call":
+                continue
+            call_id = item["call_id"]
+            if call_id in self._calls or call_id in new_calls:
+                raise UnsafeToolRetryError(f"Duplicate recorded tool call ID: {call_id}")
+            # An old, completed call may have been compacted out of the tail.
+            if self.execution_log.get_tool_interaction(call_id) is not None:
+                raise UnsafeToolRetryError(f"Tool call ID was already completed: {call_id}")
+            new_calls[call_id] = ToolCallInspection(
+                call_id=call_id, tool_name=item["name"], input=item,
+                phase=ToolPhase.RECORDED, started_count=0,
+            )
+        self._calls.update(new_calls)
+
+    def execute(self, tool_call, *, retry: bool = False) -> ToolExecutionOutcome:
+        """Execute an already-persisted and registered call; never persist its result."""
         input_item = ContextHelper.serialize_items([tool_call])[0]
         if input_item.get("type") != "function_call":
             raise ValueError("Expected function_call")
         call_id = input_item["call_id"]
-        tool_name = input_item["name"]
-        safety = self.tool_safety.get(tool_name, ToolSafety.SIDE_EFFECTING)
-        status = RecoveryInspector(self.execution_log).inspect().get(call_id)
+        status = self._calls.get(call_id)
         if status is None:
-            raise ValueError(f"Tool call not durably recorded: {call_id}")
-        if (status.tool_name != tool_name or status.input.get("arguments") != input_item.get("arguments")):
+            raise ValueError(f"Tool call not registered after durable recording: {call_id}")
+        if status.input != input_item:
             raise ValueError(f"Tool call changed since recording: {call_id}")
-        # A completed call may have been compacted out of the recovery tail.
-        # The durable ledger protects its call_id from accidental reuse.
-        if self.execution_log.get_tool_interaction(call_id) is not None or status.phase == ToolPhase.RESULT_RECORDED:
+        # Cheap indexed query protects against a completed result whose in-memory
+        # state update was interrupted. No Snapshot + Tail scan on this hot path.
+        if (status.phase == ToolPhase.RESULT_RECORDED or
+                self.execution_log.get_tool_interaction(call_id) is not None):
             raise UnsafeToolRetryError(f"Tool call already has result: {call_id}")
+
+        spec = self.registry.get(input_item["name"])
+        safety = spec.safety if spec is not None else ToolSafety.SIDE_EFFECTING
         if status.phase == ToolPhase.STARTED and not (retry and safety == ToolSafety.READ_ONLY):
             raise UnsafeToolRetryError(f"Unresolved tool call cannot be retried automatically: {call_id}")
         if retry and safety != ToolSafety.READ_ONLY:
-            raise UnsafeToolRetryError(f"Retry is not allowed for side-effecting tool: {tool_name}")
+            raise UnsafeToolRetryError(f"Retry is not allowed for side-effecting tool: {input_item['name']}")
 
-        # Durable execution permission MUST commit before any handler invocation.
+        # Commit STARTED before invoking the handler. A failed commit must never
+        # invoke the handler; a crash after commit leaves a safely unresolved call.
         self.execution_log.append_tool_execution_started(call_id)
+        self._calls[call_id] = replace(
+            status, phase=ToolPhase.STARTED, started_count=status.started_count + 1,
+        )
 
         try:
             arguments = json.loads(input_item["arguments"])
             if not isinstance(arguments, dict):
                 raise ValueError("Tool arguments not an object")
-            if handler is None:
-                raise KeyError(f"Unknown tool: {tool_name}")
+            if spec is None:
+                raise KeyError(f"Unknown tool: {input_item['name']}")
         except Exception as exc:
-            return self._record_result(session, input_item, {"error": repr(exc)}, False, repr(exc))
+            return self._prepare_result(input_item, {"error": repr(exc)}, False, repr(exc))
 
         try:
-            result = handler(**arguments)
+            result = spec.handler(**arguments)
         except UnknownToolOutcomeError:
             raise
         except Exception as exc:
             if safety == ToolSafety.SIDE_EFFECTING:
                 raise UnknownToolOutcomeError(
-                    f"Outcome of side-effecting tool {tool_name} ({call_id}) is unknown"
+                    f"Outcome of side-effecting tool {input_item['name']} ({call_id}) is unknown"
                 ) from exc
-            return self._record_result(session, input_item, {"error": repr(exc)}, False, repr(exc))
-        return self._record_result(session, input_item, result, True, None)
+            return self._prepare_result(input_item, {"error": repr(exc)}, False, repr(exc))
+        return self._prepare_result(input_item, result, True, None)
+
+    def mark_result_recorded(self, call_id: str) -> None:
+        """Called only AFTER AgentSession.record_tool_interaction succeeds."""
+        status = self._calls.get(call_id)
+        if status is None or status.phase != ToolPhase.STARTED:
+            raise ValueError(f"Unexpected result commit notification: {call_id}")
+        self._calls[call_id] = replace(status, phase=ToolPhase.RESULT_RECORDED)
 
     @staticmethod
-    def _record_result(session, input_item, result, success, error) -> ToolExecutionResult:
+    def _prepare_result(input_item, result, returned_normally, error) -> ToolExecutionOutcome:
         output = {
             "type": "function_call_output",
             "call_id": input_item["call_id"],
             "output": json.dumps(result, ensure_ascii=False),
         }
-        session.record_tool_interaction(
-            ToolInteraction(call_id=input_item["call_id"], input=input_item, output=output)
+        interaction = ToolInteraction(
+            call_id=input_item["call_id"], input=input_item, output=output,
         )
-        return ToolExecutionResult(result=result, success=success, error=error)
+        return ToolExecutionOutcome(
+            interaction=interaction, result=result,
+            handler_returned_normally=returned_normally, error=error,
+        )

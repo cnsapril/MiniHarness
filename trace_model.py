@@ -29,7 +29,7 @@ class ToolCallTrace:
     call_id: str
     tool_name: str
     duration_ms: float
-    success: bool
+    handler_returned_normally: bool
     error: str | None = None
 
 
