@@ -125,9 +125,8 @@ def execute_function_calls(session: AgentSession, executor: ToolExecutionManager
         logger.info("[Tool Call] %s: %s", tool_name, item.arguments)
         try:
             outcome = executor.execute(item)
-            # Session owns the atomic Tool Result + Ledger write and Context update.
-            session.record_tool_interaction(outcome.interaction)
-            executor.mark_result_recorded(call_id)
+            # State CAS + output event + pair ledger commit atomically via Session.
+            session.record_tool_interaction(outcome.interaction, outcome.started_count)
         except UnknownToolOutcomeError as exc:
             # Do not turn an uncertain external outcome into a normal tool error.
             record_tool_call_trace(trace, start, current_step, call_id, tool_name, False, repr(exc))
@@ -166,9 +165,7 @@ def agent_loop(user_prompt: str) -> str:
                 compact_session(session, client)
             # LLM调用
             response = call_llm_with_retry_and_extend_history(session, total_steps, trace)
-            # The response has been durably recorded by AgentSession; now register
-            # its tool calls in the per-session runtime before any execution.
-            executor.register_recorded_calls(response.output)
+            # AgentSession.append() atomically recorded all function calls as RECORDED.
             total_steps += 1
             # Function Call处理
             tool_call_count = execute_function_calls(

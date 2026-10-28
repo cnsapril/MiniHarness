@@ -15,35 +15,38 @@ from tool_registry import ToolRegistry, ToolSafety, ToolSpec
 
 class ToolLifecycleTest(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.path = str(Path(temporary.name) / "events.db")
-        self.log = SQLiteExecutionLog(self.path, "session-1")
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.db = str(Path(temp.name) / "agent.db")
+        self.log = SQLiteExecutionLog(self.db, "session-1")
         self.addCleanup(self.log.close)
-        self.session = AgentSession(ContextManager(ContextBudget(16384, 2048), 0.8), self.log)
+        self.session = AgentSession(
+            ContextManager(ContextBudget(16384, 2048), 0.8), self.log
+        )
         self.read_handler = lambda path: ["a.py"]
         self.side_handler = lambda: None
         self.registry = ToolRegistry([
             ToolSpec("list_files", lambda path: self.read_handler(path),
                      ToolSafety.READ_ONLY, "List files", {"type": "object"}),
             ToolSpec("increment_counter", lambda: self.side_handler(),
-                     ToolSafety.SIDE_EFFECTING, "Increment counter", {"type": "object"}),
+                     ToolSafety.SIDE_EFFECTING, "Increment", {"type": "object"}),
         ])
         self.manager = ToolExecutionManager(self.log, self.registry)
-        self.session.append([{"role": "user", "content": "Run a tool"}])
+        self.session.append([{"role": "user", "content": "Run tool"}])
 
-    def call(self, name="list_files", call_id="call_1"):
-        item = {"type": "function_call", "call_id": call_id, "name": name,
-                "arguments": json.dumps({"path": "."} if name == "list_files" else {})}
+    def item(self, tool="list_files", call_id="call_1"):
+        return {"type": "function_call", "call_id": call_id, "name": tool,
+                "arguments": json.dumps({"path": "."} if tool == "list_files" else {})}
+
+    def call(self, tool="list_files", call_id="call_1"):
+        item = self.item(tool, call_id)
         self.session.append([item])
-        self.manager.register_recorded_calls([item])
         return item
 
     def commit(self, outcome):
-        self.session.record_tool_interaction(outcome.interaction)
-        self.manager.mark_result_recorded(outcome.interaction.call_id)
+        self.session.record_tool_interaction(outcome.interaction, outcome.started_count)
 
-    def run_tool(self, item, retry=False):
+    def run(self, item, *, retry=False):
         outcome = self.manager.execute(item, retry=retry)
         self.commit(outcome)
         return outcome
@@ -51,186 +54,243 @@ class ToolLifecycleTest(unittest.TestCase):
     def inspect(self):
         return RecoveryInspector(self.log).inspect()
 
-    def test_registry_is_single_source_of_schema_and_safety(self):
-        self.assertEqual([schema["name"] for schema in self.registry.llm_schemas()],
+    def test_tool_registry_is_single_source(self):
+        self.assertEqual([x["name"] for x in self.registry.llm_schemas()],
                          ["list_files", "increment_counter"])
         self.assertEqual(self.registry.get("list_files").safety, ToolSafety.READ_ONLY)
         with self.assertRaises(ValueError):
             ToolRegistry([self.registry.get("list_files"), self.registry.get("list_files")])
 
-    def test_unregistered_call_cannot_execute(self):
-        item = {"type": "function_call", "call_id": "absent", "name": "list_files",
-                "arguments": '{"path":"."}'}
+    def test_call_registration_and_history_are_atomic(self):
+        item = self.item()
+        self.session.append([item])
+        self.assertEqual(self.inspect().get("call_1").phase, ToolPhase.RECORDED)
+        before_events = self.log.get_events()
+        before_history = self.session.get_history()
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.session.append([item])
+        self.assertEqual(self.log.get_events(), before_events)
+        self.assertEqual(self.session.get_history(), before_history)
+
+    def test_duplicate_in_same_response_rolls_back_whole_batch(self):
+        item = self.item()
         before = self.log.get_events()
-        with self.assertRaisesRegex(ValueError, "not registered"):
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.session.append([item, item])
+        self.assertIsNone(self.log.get_tool_execution("call_1"))
+        self.assertEqual(self.log.get_events(), before)
+
+    def test_not_recorded_cannot_execute(self):
+        item = self.item()
+        with self.assertRaises(UnsafeToolRetryError):
             self.manager.execute(item)
-        self.assertEqual(self.log.get_events(), before)
+        self.assertEqual(self.log.list_tool_executions(), [])
 
-    def test_recorded_not_executed_and_restore_is_read_only(self):
+    def test_restore_recovers_recorded_call_without_writes(self):
         item = self.call()
-        self.assertEqual(self.inspect().get(item["call_id"]).phase, ToolPhase.RECORDED)
-        before = self.log.get_events()
-        recovered = AgentSession.restore(ContextManager(ContextBudget(16384, 2048), 0.8), self.log)
+        events = self.log.get_events()
+        recovered = AgentSession.restore(
+            ContextManager(ContextBudget(16384, 2048), 0.8), self.log
+        )
         self.assertEqual(recovered.get_history(), self.session.get_history())
-        self.assertEqual(self.log.get_events(), before)
+        self.assertEqual(self.log.get_events(), events)
+        self.assertEqual(self.inspect().get(item["call_id"]).started_count, 0)
 
-    def test_started_commits_before_handler_and_result_is_committed_by_session(self):
+    def test_started_persisted_before_handler_and_result_by_session(self):
         item = self.call()
         def handler(path):
-            self.assertEqual(self.inspect().get(item["call_id"]).phase, ToolPhase.STARTED)
+            status = self.inspect().get("call_1")
+            self.assertEqual(status.phase, ToolPhase.STARTED)
+            self.assertEqual(status.started_count, 1)
             return ["main.py"]
         self.read_handler = handler
         outcome = self.manager.execute(item)
         self.assertTrue(outcome.handler_returned_normally)
-        self.assertEqual(self.inspect().get(item["call_id"]).phase, ToolPhase.STARTED)
-        self.assertIsNone(self.log.get_tool_interaction(item["call_id"]))
+        self.assertEqual(outcome.started_count, 1)
+        self.assertEqual(self.inspect().get("call_1").phase, ToolPhase.STARTED)
+        self.assertIsNone(self.log.get_tool_interaction("call_1"))
         self.commit(outcome)
-        self.assertEqual(self.inspect().get(item["call_id"]).phase, ToolPhase.RESULT_RECORDED)
+        self.assertEqual(self.inspect().get("call_1").phase, ToolPhase.RESULT_RECORDED)
+        self.assertEqual(self.log.get_tool_interaction("call_1"), outcome.interaction)
+        self.assertNotIn("tool_execution_started", [x["kind"] for x in self.log.get_events()])
 
-    def test_failed_started_commit_never_invokes_handler(self):
+    def test_db_denies_start_before_handler(self):
         item = self.call()
         invoked = []
         self.read_handler = lambda path: invoked.append(path)
-        with patch.object(self.log, "append_tool_execution_started", side_effect=sqlite3.OperationalError):
-            with self.assertRaises(sqlite3.OperationalError):
-                self.manager.execute(item)
+        self.log.conn.execute("""
+            CREATE TRIGGER deny_started BEFORE UPDATE OF state ON tool_executions
+            WHEN NEW.state = 'STARTED'
+            BEGIN SELECT RAISE(ABORT, 'injected'); END
+        """)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.manager.execute(item)
         self.assertEqual(invoked, [])
-        self.assertEqual(self.inspect().get(item["call_id"]).phase, ToolPhase.RECORDED)
+        self.assertEqual(self.inspect().get("call_1").phase, ToolPhase.RECORDED)
 
     def test_crash_after_started_commit_before_handler(self):
         item = self.call()
-        original = self.log.append_tool_execution_started
+        original = self.log.acquire_tool_execution
         invoked = []
-        def commit_then_crash(call_id):
-            original(call_id)
-            raise SystemExit("crash before handler")
         self.read_handler = lambda path: invoked.append(path)
-        with patch.object(self.log, "append_tool_execution_started", commit_then_crash):
+        def commit_then_crash(*args, **kwargs):
+            original(*args, **kwargs)
+            raise SystemExit("crash before handler")
+        with patch.object(self.log, "acquire_tool_execution", commit_then_crash):
             with self.assertRaises(SystemExit):
                 self.manager.execute(item)
         self.assertEqual(invoked, [])
-        self.assertEqual(self.inspect().get(item["call_id"]).phase, ToolPhase.STARTED)
+        self.assertEqual(self.inspect().get("call_1").phase, ToolPhase.STARTED)
 
-    def test_side_effect_crash_never_auto_retries_after_restart(self):
+    def test_two_managers_cannot_execute_same_call(self):
+        item = self.call()
+        called = []
+        self.read_handler = lambda path: called.append(path) or ["a.py"]
+        first = self.manager.execute(item)  # STARTED, result intentionally uncommitted
+        other = SQLiteExecutionLog(self.db, "session-1")
+        try:
+            second = ToolExecutionManager(other, self.registry)
+            with self.assertRaises(UnsafeToolRetryError):
+                second.execute(item)
+            self.assertEqual(called, ["."])
+            self.commit(first)
+            self.assertEqual(self.inspect().get("call_1").started_count, 1)
+        finally:
+            other.close()
+
+    def test_side_effect_crash_does_not_allow_retry(self):
         item = self.call("increment_counter")
-        counter = Path(self.path).with_suffix(".counter.db")
-        with sqlite3.connect(counter) as conn:
-            conn.execute("CREATE TABLE counters(n INTEGER)")
-            conn.execute("INSERT INTO counters(n) VALUES (0)")
-        def side_effect():
-            with sqlite3.connect(counter) as conn:
-                conn.execute("UPDATE counters SET n = n + 1")
-            raise SystemExit("crash after externally committed side effect")
-        self.side_handler = side_effect
+        counter_db = Path(self.db).with_suffix(".counter.db")
+        with sqlite3.connect(counter_db) as db:
+            db.execute("CREATE TABLE counter(value INTEGER)")
+            db.execute("INSERT INTO counter VALUES (0)")
+        def handler():
+            with sqlite3.connect(counter_db) as db:
+                db.execute("UPDATE counter SET value = value + 1")
+            raise SystemExit("crash after external effect")
+        self.side_handler = handler
         with self.assertRaises(SystemExit):
             self.manager.execute(item)
-        self.log.close()
-        self.log = SQLiteExecutionLog(self.path, "session-1")
-        self.manager = ToolExecutionManager(self.log, self.registry)
-        self.session = AgentSession.restore(ContextManager(ContextBudget(16384, 2048), 0.8), self.log)
-        self.assertEqual(self.inspect().get(item["call_id"]).phase, ToolPhase.STARTED)
-        with self.assertRaises(UnsafeToolRetryError):
-            self.manager.execute(item, retry=True)
-        with sqlite3.connect(counter) as conn:
-            self.assertEqual(conn.execute("SELECT n FROM counters").fetchone()[0], 1)
+        other = SQLiteExecutionLog(self.db, "session-1")
+        try:
+            recovered = ToolExecutionManager(other, self.registry)
+            with self.assertRaises(UnsafeToolRetryError):
+                recovered.authorize_retry("call_1", expected_started_count=1)
+            with self.assertRaises(UnsafeToolRetryError):
+                recovered.execute(item, retry=True)
+            with sqlite3.connect(counter_db) as db:
+                self.assertEqual(db.execute("SELECT value FROM counter").fetchone()[0], 1)
+        finally:
+            other.close()
 
-    def test_read_only_explicit_retry_records_two_starts(self):
+    def test_explicit_read_only_retry_requires_authorization(self):
         item = self.call()
         self.read_handler = lambda path: (_ for _ in ()).throw(SystemExit())
         with self.assertRaises(SystemExit):
             self.manager.execute(item)
         with self.assertRaises(UnsafeToolRetryError):
-            self.manager.execute(item)
-        self.read_handler = lambda path: ["a.py"]
+            self.manager.execute(item, retry=True)
+        self.manager.authorize_retry("call_1", expected_started_count=1)
+        self.assertEqual(self.inspect().get("call_1").phase, ToolPhase.RETRY_READY)
+        self.assertEqual(self.inspect().get("call_1").started_count, 1)
+        with self.assertRaises(UnsafeToolRetryError):
+            self.manager.execute(item)  # Ordinary first-time admission cannot use RETRY_READY
+        self.read_handler = lambda path: ["retried.py"]
         outcome = self.manager.execute(item, retry=True)
+        self.assertEqual(outcome.started_count, 2)
         self.commit(outcome)
-        status = self.inspect().get(item["call_id"])
-        self.assertEqual(status.started_count, 2)
-        self.assertEqual(status.phase, ToolPhase.RESULT_RECORDED)
+        self.assertEqual(self.inspect().get("call_1").phase, ToolPhase.RESULT_RECORDED)
+        self.assertEqual(self.inspect().get("call_1").started_count, 2)
 
-    def test_side_effect_timeout_keeps_unknown_outcome(self):
+    def test_retry_authorization_and_admission_are_cas_guarded(self):
+        item = self.call()
+        self.manager.execute(item)  # hold STARTED
+        other_log = SQLiteExecutionLog(self.db, "session-1")
+        try:
+            second = ToolExecutionManager(other_log, self.registry)
+            self.manager.authorize_retry("call_1", expected_started_count=1)
+            with self.assertRaises(UnsafeToolRetryError):
+                second.authorize_retry("call_1", expected_started_count=1)
+            outcome = second.execute(item, retry=True)
+            with self.assertRaises(UnsafeToolRetryError):
+                self.manager.execute(item, retry=True)
+            self.commit(outcome)
+        finally:
+            other_log.close()
+
+    def test_stale_result_version_is_rejected(self):
+        item = self.call()
+        first = self.manager.execute(item)
+        self.manager.authorize_retry("call_1", expected_started_count=1)
+        second = self.manager.execute(item, retry=True)
+        before = self.log.get_events()
+        with self.assertRaisesRegex(ValueError, "Stale or invalid"):
+            self.commit(first)
+        self.assertEqual(self.log.get_events(), before)
+        self.assertIsNone(self.log.get_tool_interaction("call_1"))
+        self.commit(second)
+        self.assertEqual(self.inspect().get("call_1").started_count, 2)
+
+    def test_result_transaction_rolls_back_on_ledger_failure(self):
+        item = self.call()
+        outcome = self.manager.execute(item)
+        self.log.conn.execute("""
+            CREATE TRIGGER deny_ledger BEFORE INSERT ON tool_interactions
+            BEGIN SELECT RAISE(ABORT, 'injected'); END
+        """)
+        before = self.log.get_events()
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.commit(outcome)
+        self.assertEqual(self.log.get_events(), before)
+        self.assertEqual(self.inspect().get("call_1").phase, ToolPhase.STARTED)
+        self.assertIsNone(self.log.get_tool_interaction("call_1"))
+
+    def test_unknown_side_effect_timeout_keeps_started(self):
         item = self.call("increment_counter")
         self.side_handler = lambda: (_ for _ in ()).throw(TimeoutError())
         with self.assertRaises(UnknownToolOutcomeError):
             self.manager.execute(item)
-        self.assertEqual(self.inspect().get(item["call_id"]).phase, ToolPhase.STARTED)
-        self.assertIsNone(self.log.get_tool_interaction(item["call_id"]))
-
-    def test_result_write_failure_does_not_mark_manager_completed(self):
-        item = self.call()
-        outcome = self.manager.execute(item)
-        with patch.object(self.log, "append_tool_interaction", side_effect=sqlite3.OperationalError):
-            with self.assertRaises(sqlite3.OperationalError):
-                self.session.record_tool_interaction(outcome.interaction)
-        self.assertEqual(self.manager._calls[item["call_id"]].phase, ToolPhase.STARTED)
-        self.assertEqual(self.inspect().get(item["call_id"]).phase, ToolPhase.STARTED)
-        with self.assertRaises(UnsafeToolRetryError):
-            self.manager.execute(item)
+        self.assertEqual(self.inspect().get("call_1").phase, ToolPhase.STARTED)
+        self.assertIsNone(self.log.get_tool_interaction("call_1"))
 
     def test_result_before_step_completed_is_not_reexecuted(self):
         item = self.call()
-        self.run_tool(item)
-        self.log.close()
-        reopened = SQLiteExecutionLog(self.path, "session-1")
+        self.run(item)
+        other = SQLiteExecutionLog(self.db, "session-1")
         try:
-            recovered = AgentSession.restore(ContextManager(ContextBudget(16384, 2048), 0.8), reopened)
-            self.assertEqual(recovered.get_step_ends(), [])
-            self.assertEqual(recovered.get_history()[-1]["type"], "function_call_output")
-            manager = ToolExecutionManager(reopened, self.registry)
+            restored = AgentSession.restore(
+                ContextManager(ContextBudget(16384, 2048), 0.8), other
+            )
+            self.assertEqual(restored.get_step_ends(), [])
+            self.assertEqual(restored.get_history()[-1]["type"], "function_call_output")
             with self.assertRaises(UnsafeToolRetryError):
-                manager.execute(item)
+                ToolExecutionManager(other, self.registry).execute(item)
         finally:
-            reopened.close()
+            other.close()
 
-    def test_duplicate_id_compacted_out_is_rejected(self):
+    def test_compaction_does_not_erase_execution_identity(self):
         item = self.call(call_id="old")
-        self.run_tool(item)
+        self.run(item)
         self.session.mark_step_complete()
         self.session.replace_history([{"role": "user", "content": "Summary"}], [])
-        # A fresh manager only sees the latest snapshot; the old call is gone
-        # from its in-memory state. The durable ledger must still reject it.
-        self.manager = ToolExecutionManager(self.log, self.registry)
-        self.session.append([item])  # injected reused call ID
-        with self.assertRaises(UnsafeToolRetryError):
-            self.manager.register_recorded_calls([item])
-        invoked = []
-        self.read_handler = lambda path: invoked.append(path)
-        with self.assertRaises(UnsafeToolRetryError):
-            self.manager.execute(item)
-        self.assertEqual(invoked, [])
+        before = self.log.get_events()
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.session.append([item])
+        self.assertEqual(self.log.get_events(), before)
+        self.assertEqual(self.inspect().get("old").phase, ToolPhase.RESULT_RECORDED)
 
-    def test_snapshot_tail_inspection_and_restore(self):
-        old = self.call(call_id="old")
-        self.run_tool(old)
-        self.session.mark_step_complete()
-        self.session.replace_history(self.session.get_history(), self.session.get_step_ends())
-        new = self.call(call_id="new")
-        self.log.append_tool_execution_started("new")
-        status = self.inspect()
-        self.assertEqual(status.get("new").phase, ToolPhase.STARTED)
-        self.assertEqual(status.get("old").phase, ToolPhase.RESULT_RECORDED)
-        restored = AgentSession.restore(ContextManager(ContextBudget(16384, 2048), 0.8), self.log)
-        self.assertEqual(restored.get_history(), self.session.get_history())
-
-    def test_registering_duplicate_in_current_response_rejects_batch(self):
-        item = {"type": "function_call", "call_id": "dup",
-                "name": "list_files", "arguments": '{"path":"."}'}
-        self.session.append([item, item])
-        with self.assertRaises(UnsafeToolRetryError):
-            self.manager.register_recorded_calls([item, item])
-        self.assertNotIn("dup", self.manager._calls)
-
-    def test_normal_execution_does_not_replay_snapshot_tail(self):
+    def test_recovery_inspection_does_not_replay_event_tail(self):
         item = self.call()
         with patch.object(self.log, "get_snapshots_for_recovery",
-                          side_effect=AssertionError("Unexpected full replay in hot path")):
-            self.run_tool(item)
-        self.assertEqual(self.inspect().get(item["call_id"]).phase, ToolPhase.RESULT_RECORDED)
+                          side_effect=AssertionError("No replay should happen")):
+            self.assertEqual(self.inspect().get("call_1").phase, ToolPhase.RECORDED)
+            self.run(item)
+            self.assertEqual(self.inspect().get("call_1").phase, ToolPhase.RESULT_RECORDED)
 
     def test_handler_returned_normally_is_not_business_success(self):
         item = self.call("increment_counter")
         self.side_handler = lambda: {"payment_status": "declined"}
-        outcome = self.run_tool(item)
+        outcome = self.run(item)
         self.assertTrue(outcome.handler_returned_normally)
         self.assertEqual(outcome.result["payment_status"], "declined")
 

@@ -25,9 +25,6 @@ class AgentSession:
             elif item["kind"] == "history_items":
                 # 处理历史消息replay
                 session._replay_history_items(item["items"])
-            elif item["kind"] == "tool_execution_started":
-                # Execution lifecycle events do not change the working context.
-                pass
             else:
                 raise ValueError(f"Unrecognized kind {item['kind']}")
         # restore结束，直接重置token cache，下次lazy recalculate
@@ -63,10 +60,11 @@ class AgentSession:
             self.context_manager.invalidate()
             raise
 
-    def record_tool_interaction(self, interaction: ToolInteraction) -> None:
-        """Persist a completed interaction before updating working context."""
+    def record_tool_interaction(self, interaction: ToolInteraction,
+                                expected_started_count: int) -> None:
+        """Commit the STARTED version, output and ledger before updating context."""
         output_item = deepcopy(interaction.output)
-        self.execution_log.append_tool_interaction(interaction)
+        self.execution_log.append_tool_interaction(interaction, expected_started_count)
         self._history.append(output_item)
         try:
             self.context_manager.append(self._history, [output_item])

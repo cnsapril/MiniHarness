@@ -32,7 +32,8 @@ class ToolInteractionLedgerTest(unittest.TestCase):
         item = self.interaction()
         self.session.append([{"role": "user", "content": "List src"}])
         self.session.append([item.input])
-        self.session.record_tool_interaction(item)
+        version = self.log.acquire_tool_execution("call_1", 0)
+        self.session.record_tool_interaction(item, version)
         self.session.mark_step_complete()
         self.assertEqual(self.log.get_tool_interaction("call_1"), item)
         self.assertEqual(self.session.get_history()[-1], item.output)
@@ -57,11 +58,12 @@ class ToolInteractionLedgerTest(unittest.TestCase):
     def test_duplicate_rolls_back_event_and_ledger(self):
         item = self.interaction()
         self.session.append([item.input])
-        self.session.record_tool_interaction(item)
+        version = self.log.acquire_tool_execution("call_1", 0)
+        self.session.record_tool_interaction(item, version)
         before_history = self.session.get_history()
         before_events = self.log.get_events()
-        with self.assertRaises(sqlite3.IntegrityError):
-            self.session.record_tool_interaction(item)
+        with self.assertRaisesRegex(ValueError, "Stale or invalid"):
+            self.session.record_tool_interaction(item, version)
         self.assertEqual(self.log.get_events(), before_events)
         self.assertEqual(self.session.get_history(), before_history)
 
@@ -80,7 +82,9 @@ class ToolInteractionLedgerTest(unittest.TestCase):
         item = ToolInteraction(call_id="call_1", input=input_item, output=output_item)
         input_item["name"] = "modified"
         output_item["output"] = "changed"
-        self.session.record_tool_interaction(item)
+        self.session.append([item.input])
+        version = self.log.acquire_tool_execution("call_1", 0)
+        self.session.record_tool_interaction(item, version)
         self.assertEqual(self.log.get_tool_interaction("call_1").input["name"], "list_files")
         self.assertEqual(self.log.get_tool_interaction("call_1").output["output"], '["main.py"]')
 
