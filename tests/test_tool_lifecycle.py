@@ -61,9 +61,10 @@ class ToolLifecycleTest(unittest.TestCase):
     def test_unregistered_call_cannot_execute(self):
         item = {"type": "function_call", "call_id": "absent", "name": "list_files",
                 "arguments": '{"path":"."}'}
+        before = self.log.get_events()
         with self.assertRaisesRegex(ValueError, "not registered"):
             self.manager.execute(item)
-        self.assertEqual(self.log.get_events(), self.log.get_events())
+        self.assertEqual(self.log.get_events(), before)
 
     def test_recorded_not_executed_and_restore_is_read_only(self):
         item = self.call()
@@ -186,6 +187,9 @@ class ToolLifecycleTest(unittest.TestCase):
         self.run_tool(item)
         self.session.mark_step_complete()
         self.session.replace_history([{"role": "user", "content": "Summary"}], [])
+        # A fresh manager only sees the latest snapshot; the old call is gone
+        # from its in-memory state. The durable ledger must still reject it.
+        self.manager = ToolExecutionManager(self.log, self.registry)
         self.session.append([item])  # injected reused call ID
         with self.assertRaises(UnsafeToolRetryError):
             self.manager.register_recorded_calls([item])
@@ -207,6 +211,14 @@ class ToolLifecycleTest(unittest.TestCase):
         self.assertEqual(status.get("old").phase, ToolPhase.RESULT_RECORDED)
         restored = AgentSession.restore(ContextManager(ContextBudget(16384, 2048), 0.8), self.log)
         self.assertEqual(restored.get_history(), self.session.get_history())
+
+    def test_registering_duplicate_in_current_response_rejects_batch(self):
+        item = {"type": "function_call", "call_id": "dup",
+                "name": "list_files", "arguments": '{"path":"."}'}
+        self.session.append([item, item])
+        with self.assertRaises(UnsafeToolRetryError):
+            self.manager.register_recorded_calls([item, item])
+        self.assertNotIn("dup", self.manager._calls)
 
     def test_normal_execution_does_not_replay_snapshot_tail(self):
         item = self.call()
