@@ -57,6 +57,10 @@ class SQLiteExecutionLog:
         serializable = ContextHelper.serialize_items(items)
         self.append_event("history_items", {"items": serializable})
 
+    def append_tool_execution_started(self, call_id: str) -> None:
+        """Record the execution admission before calling the tool handler."""
+        self.append_event("tool_execution_started", {"call_id": call_id})
+
     def append_tool_interaction(self, interaction: ToolInteraction) -> None:
         """Atomically journal the tool output and index the complete call/result pair."""
         payload = interaction.to_payload()

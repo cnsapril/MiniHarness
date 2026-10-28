@@ -1,4 +1,4 @@
-import json
+import argparse
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,7 +15,12 @@ from logging_config import setup_logging
 from session import AgentSession
 from sqlite_execution_log import SQLiteExecutionLog
 from trace_model import AgentTrace, LLMCallTrace, ToolCallTrace, AgentStatus
-from tool_model import ToolInteraction
+from tool_execution import (
+    RecoveryInspector,
+    ToolExecutionManager,
+    ToolSafety,
+    UnknownToolOutcomeError,
+)
 
 PROJECT_ROOT = Path.cwd().resolve()
 logger = logging.getLogger(__name__)
@@ -36,6 +41,11 @@ def list_files(path: str) -> list[str]:
 
 TOOL_HANDLERS = {
     "list_files": list_files
+}
+
+# Tool safety is trusted local configuration, not a model-provided hint.
+TOOL_SAFETY = {
+    "list_files": ToolSafety.READ_ONLY,
 }
 
 # Initializations
@@ -146,47 +156,30 @@ def record_tool_call_trace(trace: AgentTrace, start: float, current_step: int, c
 
 def execute_function_calls(session: AgentSession, response, total_tool_calls: int, current_step: int,
                            trace: AgentTrace) -> int:
+    executor = ToolExecutionManager(session.execution_log, TOOL_SAFETY)
     tool_call_count = 0
     for item in response.output:
-        # 非function call的先跳过
         if item.type != "function_call":
             logger.info(item)
             continue
 
-        # 额度超限检查
         if total_tool_calls + tool_call_count >= MAX_TOOL_CALLS:
             raise LimitExceededError(f"Agent tool calls have exceeded limit {MAX_TOOL_CALLS}")
-        # 进行function call调用
+
         start = perf_counter()
         tool_name = item.name
         call_id = item.call_id
-        error = None
+        logger.info("[Tool Call] %s: %s", tool_name, item.arguments)
         try:
-            arguments = json.loads(item.arguments)
-            if not isinstance(arguments, dict):
-                raise ValueError("Tool arguments not an object")
-            logger.info("[Tool Call] %s: %s", tool_name, arguments)
-            handler = TOOL_HANDLERS[tool_name]
-            result = handler(**arguments)
-            success = True
-        except Exception as e:
-            error = repr(e)
-            result = {"error": error}
-            success = False
-        # 处理function call结果
-        record_tool_call_trace(trace, start, current_step, call_id, tool_name, success, error)
-        logger.info("[Tool Result] %s", result)
-        output_item = {
-            "type": "function_call_output",
-            "call_id": call_id,
-            "output": json.dumps(result, ensure_ascii=False)
-        }
-        interaction = ToolInteraction(
-            call_id=call_id,
-            input=item.model_dump(mode="json"),
-            output=output_item
-        )
-        session.record_tool_interaction(interaction)
+            outcome = executor.execute(session, item, TOOL_HANDLERS.get(tool_name))
+        except UnknownToolOutcomeError as exc:
+            # Do not turn an uncertain external outcome into a normal tool error.
+            record_tool_call_trace(trace, start, current_step, call_id, tool_name, False, repr(exc))
+            raise
+
+        record_tool_call_trace(trace, start, current_step, call_id,
+                               tool_name, outcome.success, outcome.error)
+        logger.info("[Tool Result] %s", outcome.result)
         tool_call_count += 1
 
     return tool_call_count
@@ -204,11 +197,12 @@ def agent_loop(user_prompt: str) -> str:
     )
     execution_log = SQLiteExecutionLog(DB_PATH, str(uuid4()))
     session = AgentSession(context_manager, execution_log)
-    session.append([{"role": "user", "content": user_prompt}])
+    logger.info("[Session ID] %s", execution_log.get_session_id())
     trace = AgentTrace()
     total_steps = 0
     total_tool_calls = 0
     try:
+        session.append([{"role": "user", "content": user_prompt}])
         while True:
             # 处理上下文压缩
             if session.should_compact():
@@ -237,10 +231,47 @@ def agent_loop(user_prompt: str) -> str:
         trace.ended_at = datetime.now(timezone.utc)
         logger.info("=== Agent Trace ===")
         logger.info(trace)
+        execution_log.close()
+
+
+def inspect_session(session_id: str):
+    """Explicit recovery inspection; never resumes or retries a tool automatically."""
+    log = SQLiteExecutionLog(DB_PATH, session_id)
+    try:
+        context_manager = ContextManager(
+            ContextBudget(MAX_CONTEXT_TOKEN_LEN, RESERVED_OUTPUT_TOKEN_LEN),
+            compaction_ratio=COMPACTION_RATIO,
+        )
+        session = AgentSession.restore(context_manager, log)
+        report = RecoveryInspector(log).inspect()
+        print(f"Session: {session_id}")
+        print(f"Restored history items: {len(session.get_history())}")
+        print(f"Completed steps: {len(session.get_step_ends())}")
+        if not report.calls:
+            print("No tool calls in the recovery window.")
+        for call in report.calls:
+            print(f"{call.call_id} | {call.tool_name} | {call.phase.value} | starts={call.started_count}")
+        if report.unresolved:
+            print("Unresolved calls require explicit policy review; no automatic retry.")
+        return report
+    finally:
+        log.close()
 
 
 if __name__ == "__main__":
     setup_logging()
-    assistant_message = agent_loop("List my current project working directory.")
-    logger.info("\n[Agent Response]")
-    logger.info(assistant_message)
+    parser = argparse.ArgumentParser(description="MiniHarness coding agent")
+    commands = parser.add_subparsers(dest="command")
+    new_command = commands.add_parser("new", help="Run a new agent session")
+    new_command.add_argument("prompt")
+    inspect_command = commands.add_parser("inspect", help="Inspect an existing session")
+    inspect_command.add_argument("--session", required=True, dest="session_id")
+    args = parser.parse_args()
+
+    if args.command == "inspect":
+        inspect_session(args.session_id)
+    else:
+        prompt = args.prompt if args.command == "new" else "List my current project working directory."
+        assistant_message = agent_loop(prompt)
+        logger.info("\n[Agent Response]")
+        logger.info(assistant_message)

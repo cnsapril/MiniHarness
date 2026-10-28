@@ -20,7 +20,7 @@ class CompactorTest(TestCase):
             reserved_output_tokens=2048
         )
         manager = ContextManager(budget, 0.8)
-        execution_log = SQLiteExecutionLog(DB_PATH, str(UUID()))
+        execution_log = SQLiteExecutionLog(DB_PATH, str(uuid4()))
         session = AgentSession(manager, execution_log)
         session.append([
             {"role": "user", "content": "List project files"}
