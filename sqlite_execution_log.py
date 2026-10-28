@@ -40,6 +40,23 @@ class SQLiteExecutionLog:
                 FOREIGN KEY (event_id) REFERENCES events(id)
             )
         """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS tool_executions (
+                session_id TEXT NOT NULL,
+                call_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                input_json TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(
+                    state IN ('RECORDED', 'STARTED', 'RETRY_READY', 'RESULT_RECORDED')
+                ),
+                started_count INTEGER NOT NULL DEFAULT 0 CHECK(started_count >= 0),
+                PRIMARY KEY (session_id, call_id)
+            )
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tool_executions_pending
+            ON tool_executions(session_id, state)
+        """)
         self.conn.commit()
 
     def get_session_id(self) -> str:
@@ -54,13 +71,99 @@ class SQLiteExecutionLog:
             """, (self.session_id, kind, data))
 
     def append_items(self, items: list):
-        serializable = ContextHelper.serialize_items(items)
-        self.append_event("history_items", {"items": serializable})
+        """Atomically journal history and register new function calls.
 
-    def append_tool_interaction(self, interaction: ToolInteraction) -> None:
-        """Atomically journal the tool output and index the complete call/result pair."""
+        The unique key on (session_id, call_id) prevents a duplicated call
+        from ever entering the durable history as a new execution request.
+        """
+        serializable = ContextHelper.serialize_items(items)
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO events(session_id, kind, payload) VALUES (?, ?, ?)",
+                (self.session_id, "history_items",
+                 json.dumps({"items": serializable}, ensure_ascii=False))
+            )
+            for item in serializable:
+                if item.get("type") == "function_call":
+                    self.conn.execute(
+                        """INSERT INTO tool_executions(
+                            session_id, call_id, tool_name, input_json, state
+                        ) VALUES (?, ?, ?, ?, 'RECORDED')""",
+                        (self.session_id, item["call_id"], item["name"],
+                         json.dumps(item, ensure_ascii=False))
+                    )
+
+    def get_tool_execution(self, call_id: str) -> dict | None:
+        row = self.conn.execute(
+            """SELECT call_id, tool_name, input_json, state, started_count
+               FROM tool_executions WHERE session_id = ? AND call_id = ?""",
+            (self.session_id, call_id)
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "call_id": row[0], "tool_name": row[1], "input": json.loads(row[2]),
+            "state": row[3], "started_count": row[4],
+        }
+
+    def list_tool_executions(self) -> list[dict]:
+        rows = self.conn.execute(
+            """SELECT call_id, tool_name, input_json, state, started_count
+               FROM tool_executions WHERE session_id = ? ORDER BY rowid""",
+            (self.session_id,)
+        ).fetchall()
+        return [
+            {"call_id": row[0], "tool_name": row[1], "input": json.loads(row[2]),
+             "state": row[3], "started_count": row[4]}
+            for row in rows
+        ]
+
+    def acquire_tool_execution(self, call_id: str, expected_started_count: int,
+                               *, retry: bool = False) -> int:
+        """Atomic optimistic-lock admission; returns the newly granted version."""
+        expected_state = "RETRY_READY" if retry else "RECORDED"
+        with self.conn:
+            updated = self.conn.execute(
+                """UPDATE tool_executions
+                   SET state = 'STARTED', started_count = started_count + 1
+                   WHERE session_id = ? AND call_id = ?
+                     AND state = ? AND started_count = ?""",
+                (self.session_id, call_id, expected_state, expected_started_count)
+            )
+            if updated.rowcount != 1:
+                raise ValueError(f"Execution admission rejected for {call_id}")
+        return expected_started_count + 1
+
+    def authorize_tool_retry(self, call_id: str, expected_started_count: int) -> None:
+        """Explicit recovery transition; does not itself invoke the handler."""
+        with self.conn:
+            updated = self.conn.execute(
+                """UPDATE tool_executions SET state = 'RETRY_READY'
+                   WHERE session_id = ? AND call_id = ?
+                     AND state = 'STARTED' AND started_count = ?""",
+                (self.session_id, call_id, expected_started_count)
+            )
+            if updated.rowcount != 1:
+                raise ValueError(f"Retry authorization rejected for {call_id}")
+
+    def append_tool_interaction(self, interaction: ToolInteraction,
+                                expected_started_count: int) -> None:
+        """Atomically commit state, context-result event and pair ledger.
+
+        A stale attempt's result cannot overwrite a newer STARTED version.
+        """
         payload = interaction.to_payload()
         with self.conn:
+            updated = self.conn.execute(
+                """UPDATE tool_executions SET state = 'RESULT_RECORDED'
+                   WHERE session_id = ? AND call_id = ?
+                     AND state = 'STARTED' AND started_count = ?""",
+                (self.session_id, interaction.call_id, expected_started_count)
+            )
+            if updated.rowcount != 1:
+                raise ValueError(
+                    f"Stale or invalid tool result commit: {interaction.call_id}"
+                )
             cursor = self.conn.execute(
                 "INSERT INTO events(session_id, kind, payload) VALUES (?, ?, ?)",
                 (self.session_id, "history_items",

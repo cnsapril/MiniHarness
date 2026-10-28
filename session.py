@@ -60,10 +60,11 @@ class AgentSession:
             self.context_manager.invalidate()
             raise
 
-    def record_tool_interaction(self, interaction: ToolInteraction) -> None:
-        """Persist a completed interaction before updating working context."""
+    def record_tool_interaction(self, interaction: ToolInteraction,
+                                expected_started_count: int) -> None:
+        """Commit the STARTED version, output and ledger before updating context."""
         output_item = deepcopy(interaction.output)
-        self.execution_log.append_tool_interaction(interaction)
+        self.execution_log.append_tool_interaction(interaction, expected_started_count)
         self._history.append(output_item)
         try:
             self.context_manager.append(self._history, [output_item])
