@@ -46,7 +46,7 @@ class ToolLifecycleTest(unittest.TestCase):
     def commit(self, outcome):
         self.session.record_tool_interaction(outcome.interaction, outcome.started_count)
 
-    def run(self, item, *, retry=False):
+    def run_tool(self, item, *, retry=False):
         outcome = self.manager.execute(item, retry=retry)
         self.commit(outcome)
         return outcome
@@ -255,7 +255,7 @@ class ToolLifecycleTest(unittest.TestCase):
 
     def test_result_before_step_completed_is_not_reexecuted(self):
         item = self.call()
-        self.run(item)
+        self.run_tool(item)
         other = SQLiteExecutionLog(self.db, "session-1")
         try:
             restored = AgentSession.restore(
@@ -270,7 +270,7 @@ class ToolLifecycleTest(unittest.TestCase):
 
     def test_compaction_does_not_erase_execution_identity(self):
         item = self.call(call_id="old")
-        self.run(item)
+        self.run_tool(item)
         self.session.mark_step_complete()
         self.session.replace_history([{"role": "user", "content": "Summary"}], [])
         before = self.log.get_events()
@@ -284,13 +284,13 @@ class ToolLifecycleTest(unittest.TestCase):
         with patch.object(self.log, "get_snapshots_for_recovery",
                           side_effect=AssertionError("No replay should happen")):
             self.assertEqual(self.inspect().get("call_1").phase, ToolPhase.RECORDED)
-            self.run(item)
+            self.run_tool(item)
             self.assertEqual(self.inspect().get("call_1").phase, ToolPhase.RESULT_RECORDED)
 
     def test_handler_returned_normally_is_not_business_success(self):
         item = self.call("increment_counter")
         self.side_handler = lambda: {"payment_status": "declined"}
-        outcome = self.run(item)
+        outcome = self.run_tool(item)
         self.assertTrue(outcome.handler_returned_normally)
         self.assertEqual(outcome.result["payment_status"], "declined")
 
