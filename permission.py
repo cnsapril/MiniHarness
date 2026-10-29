@@ -38,7 +38,7 @@ class PermissionPolicy:
 
         if spec.name in ("list_files", "write_file"):
             path = arguments.get("path")
-            if not isinstance(path, str) or not path or "\\x00" in path:
+            if not isinstance(path, str) or not path or "\x00" in path:
                 return PermissionDecision(PermissionRequirement.DENY, "Invalid workspace path")
             rel = Path(path)
             # Reject traversal outright, even if it happens to resolve inside root.

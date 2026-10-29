@@ -95,7 +95,7 @@ class PermissionApprovalTest(unittest.TestCase):
         self.assertEqual(self.log.get_tool_execution("call-1")["state"], "RESULT_RECORDED")
         with self.assertRaises(UnsafeToolRetryError):
             self.manager.execute(item)
-        with self.assertRaises(ValueError):
+        with self.assertRaises(UnsafeToolRetryError):
             self.manager.approve("call-1", expected_started_count=0)
 
     def test_two_managers_cannot_consume_same_approval(self):

@@ -71,7 +71,7 @@ def write_file(path: str, content: str) -> str:
         raise RuntimeError("Safe workspace writes require POSIX O_NOFOLLOW")
     rel = Path(path)
     if (not path or rel.is_absolute() or ".." in rel.parts
-            or len(rel.parts) == 0 or "\\x00" in path):
+            or len(rel.parts) == 0 or "\x00" in path):
         raise PermissionError("Invalid workspace file path")
 
     dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
