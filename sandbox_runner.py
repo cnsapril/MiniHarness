@@ -72,6 +72,8 @@ class SandboxRunner:
             "--env", "PYTHONDONTWRITEBYTECODE=1",
             "--env", "HOME=/tmp",
             "--env", "PYTHONPATH=/workspace",
+            # Host-side Docker CLI tests must not run from inside the container.
+            "--env", "MINIHARNESS_IN_SANDBOX=1",
             "--workdir", "/workspace",
             self.config.image,
             "python", "-m", "unittest", "discover",

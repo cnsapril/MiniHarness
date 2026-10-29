@@ -38,6 +38,15 @@ are separate structured statuses.
 
 ## Tests
 
+Unit tests use a fake Docker executable, **no Docker daemon required**. These
+host-side runner tests are skipped *inside the sandbox* because the container
+does not contain a Docker daemon or executable Docker CLI. Other project tests
+still run normally in the container.
+
+Tests that create SQLite files use temporary directories under `/tmp` instead
+of writing to the read-only `/workspace`. On macOS, the test compares Docker's
+mount path against its resolved real path (`/var` may resolve to `/private/var`).
+
 Unit tests use a fake Docker executable, **no Docker daemon required**:
 
 ```bash

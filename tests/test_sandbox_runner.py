@@ -46,6 +46,8 @@ else:
 '''
 
 
+@unittest.skipIf(os.environ.get("MINIHARNESS_IN_SANDBOX") == "1",
+                 "Host-only Docker CLI tests; no Docker daemon inside sandbox")
 class SandboxRunnerTest(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
@@ -87,12 +89,15 @@ class SandboxRunnerTest(unittest.TestCase):
             ["--read-only", "--mount"], ["--pull=never", "--name"],
         ):
             self.assertIn(pair, [args[i:i+len(pair)] for i in range(len(args))])
-        self.assertIn(f"type=bind,src={self.root},dst=/workspace,readonly", args)
+        self.assertIn(
+            f"type=bind,src={self.root.resolve()},dst=/workspace,readonly", args
+        )
         self.assertIn("/tmp:rw,nosuid,nodev,size=64m,mode=1777", args)
         self.assertEqual(args[-8:], ["python", "-m", "unittest", "discover",
                                      "-s", "tests", "-p", "test_*.py"])
         self.assertNotIn("sh", args)
         self.assertNotIn("bash", args)
+        self.assertIn("MINIHARNESS_IN_SANDBOX=1", args)
         self.assertNotIn("--privileged", args)
         self.assertNotIn("/var/run/docker.sock", " ".join(args))
 
@@ -185,8 +190,11 @@ class SandboxRunnerTest(unittest.TestCase):
         self.assertEqual(db.get_tool_execution("test-call")["state"], "RESULT_RECORDED")
 
 
-@unittest.skipUnless(os.environ.get("MINIHARNESS_DOCKER_TEST") == "1",
-                     "Set MINIHARNESS_DOCKER_TEST=1 after building the sandbox image")
+@unittest.skipUnless(
+    os.environ.get("MINIHARNESS_DOCKER_TEST") == "1"
+    and os.environ.get("MINIHARNESS_IN_SANDBOX") != "1",
+    "Real Docker smoke test requires the host and MINIHARNESS_DOCKER_TEST=1",
+)
 class RealDockerSmokeTest(unittest.TestCase):
     def test_real_container_runs_unittests(self):
         project = Path(__file__).resolve().parents[1]
