@@ -7,6 +7,7 @@ conversation; Tool Interaction Ledger retains completed input/output pairs.
 import json
 from dataclasses import dataclass
 from enum import Enum
+from typing import ClassVar
 
 from context_manager import ContextHelper
 from permission import PermissionPolicy, PermissionRequirement
@@ -19,6 +20,12 @@ class ToolPhase(str, Enum):
     STARTED = "STARTED"
     RETRY_READY = "RETRY_READY"
     RESULT_RECORDED = "RESULT_RECORDED"
+    DENIED = "DENIED"
+
+
+class ToolDispatchStatus(str, Enum):
+    COMPLETED = "COMPLETED"
+    APPROVAL_PENDING = "APPROVAL_PENDING"
     DENIED = "DENIED"
 
 
@@ -80,6 +87,7 @@ class RecoveryInspector:
 @dataclass(frozen=True)
 class ToolExecutionOutcome:
     """Prepared response; not yet committed and not necessarily business success."""
+    status: ClassVar[ToolDispatchStatus] = ToolDispatchStatus.COMPLETED
     interaction: ToolInteraction
     result: object
     handler_returned_normally: bool
@@ -90,6 +98,7 @@ class ToolExecutionOutcome:
 @dataclass(frozen=True)
 class ToolApprovalPending:
     """Ordinary control-flow outcome: an approval is needed before execution."""
+    status: ClassVar[ToolDispatchStatus] = ToolDispatchStatus.APPROVAL_PENDING
     call_id: str
     expected_started_count: int
     retry: bool
@@ -97,6 +106,7 @@ class ToolApprovalPending:
 
 @dataclass(frozen=True)
 class ToolDenialOutcome:
+    status: ClassVar[ToolDispatchStatus] = ToolDispatchStatus.DENIED
     interaction: ToolInteraction
     reason: str
     expected_started_count: int
@@ -219,13 +229,19 @@ class ToolExecutionManager:
             )
         requires_approval = decision.requirement == PermissionRequirement.ASK
         if requires_approval:
-            try:
-                status = self.execution_log.ensure_pending_approval(
-                    call_id, expected_count, retry=retry
-                )
-            except ValueError as exc:
-                raise UnsafeToolRetryError(str(exc)) from exc
+            status = self.execution_log.get_tool_approval(call_id, expected_count)
+            if status is None:
+                # Create exactly once; concurrent duplicate creation fails
+                # rather than being silently swallowed by INSERT OR IGNORE.
+                try:
+                    self.execution_log.create_pending_approval(
+                        call_id, expected_count, retry=retry
+                    )
+                except ValueError as exc:
+                    raise UnsafeToolRetryError(str(exc)) from exc
+                return ToolApprovalPending(call_id, expected_count, retry)
             if status == "PENDING":
+                # A resumed/duplicate read is not a second approval request.
                 return ToolApprovalPending(call_id, expected_count, retry)
             if status != "APPROVED":
                 raise UnsafeToolRetryError(f"Approval is not usable: {call_id}")

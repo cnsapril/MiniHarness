@@ -139,25 +139,26 @@ class SQLiteExecutionLog:
         ).fetchone()
         return row[0] if row else None
 
-    def ensure_pending_approval(self, call_id: str, expected_started_count: int,
-                                *, retry: bool = False) -> str:
-        """Idempotently create an approval, only for a still-pending execution."""
+    def create_pending_approval(self, call_id: str, expected_started_count: int,
+                                *, retry: bool = False) -> None:
+        """Create one approval request; duplicate attempts are NOT silently ignored.
+
+        Existing PENDING/APPROVED approvals are read separately by the Manager.
+        The INSERT is conditional on the current execution state and version.
+        """
         expected_state = "RETRY_READY" if retry else "RECORDED"
         with self.conn:
-            row = self.conn.execute(
-                """SELECT state, started_count FROM tool_executions
-                   WHERE session_id = ? AND call_id = ?""",
-                (self.session_id, call_id)
-            ).fetchone()
-            if row != (expected_state, expected_started_count):
-                raise ValueError(f"Cannot request approval for {call_id}")
-            self.conn.execute(
-                """INSERT OR IGNORE INTO tool_approvals(
-                      session_id, call_id, expected_started_count, status)
-                   VALUES (?, ?, ?, 'PENDING')""",
-                (self.session_id, call_id, expected_started_count)
+            inserted = self.conn.execute(
+                """INSERT INTO tool_approvals(
+                       session_id, call_id, expected_started_count, status)
+                   SELECT session_id, call_id, started_count, 'PENDING'
+                   FROM tool_executions
+                   WHERE session_id = ? AND call_id = ?
+                     AND state = ? AND started_count = ?""",
+                (self.session_id, call_id, expected_state, expected_started_count)
             )
-            return self.get_tool_approval(call_id, expected_started_count)
+            if inserted.rowcount != 1:
+                raise ValueError(f"Cannot request approval for {call_id}")
 
     def approve_tool_execution(self, call_id: str, expected_started_count: int,
                                *, retry: bool = False) -> None:

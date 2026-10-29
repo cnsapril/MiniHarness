@@ -14,7 +14,7 @@ from logging_config import setup_logging
 from session import AgentSession
 from sqlite_execution_log import SQLiteExecutionLog
 from trace_model import AgentTrace, LLMCallTrace, ToolCallTrace, AgentStatus
-from tool_execution import (ToolApprovalPending, RecoveryInspector, ToolDenialOutcome,
+from tool_execution import (RecoveryInspector, ToolDispatchStatus,
                             ToolExecutionManager, UnknownToolOutcomeError)
 from tool_registry import default_tool_registry
 
@@ -126,7 +126,7 @@ def execute_function_calls(session: AgentSession, executor: ToolExecutionManager
         logger.info("[Tool Call] %s: %s", tool_name, item.arguments)
         try:
             outcome = executor.execute(item)
-            if isinstance(outcome, ToolApprovalPending):
+            if outcome.status == ToolDispatchStatus.APPROVAL_PENDING:
                 # Pending approval is normal workflow state, not an exception.
                 # Only trusted CLI input can approve; never accept LLM-supplied approval.
                 print(f"\nApproval requested for {tool_name} (call_id={call_id}, "
@@ -139,7 +139,7 @@ def execute_function_calls(session: AgentSession, executor: ToolExecutionManager
                         retry=outcome.retry,
                     )
                     outcome = executor.execute(item, retry=outcome.retry)
-                    if isinstance(outcome, ToolApprovalPending):
+                    if outcome.status == ToolDispatchStatus.APPROVAL_PENDING:
                         raise RuntimeError("Approved tool call unexpectedly remains pending")
                 else:
                     outcome = executor.reject(
@@ -147,7 +147,7 @@ def execute_function_calls(session: AgentSession, executor: ToolExecutionManager
                         retry=outcome.retry,
                     )
 
-            if isinstance(outcome, ToolDenialOutcome):
+            if outcome.status == ToolDispatchStatus.DENIED:
                 session.record_tool_denial(
                     outcome.interaction, outcome.expected_started_count,
                     retry=outcome.retry, rejected_approval=outcome.rejected_approval,
@@ -157,7 +157,7 @@ def execute_function_calls(session: AgentSession, executor: ToolExecutionManager
                     f"PERMISSION_DENIED: {outcome.reason}",
                 )
                 logger.info("[Tool Denied] %s", outcome.reason)
-            else:
+            elif outcome.status == ToolDispatchStatus.COMPLETED:
                 # State CAS + output event + ledger commit atomically via Session.
                 session.record_tool_interaction(outcome.interaction, outcome.started_count)
                 record_tool_call_trace(
@@ -165,6 +165,8 @@ def execute_function_calls(session: AgentSession, executor: ToolExecutionManager
                     tool_name, outcome.handler_returned_normally, outcome.error,
                 )
                 logger.info("[Tool Result] %s", outcome.result)
+            else:
+                raise RuntimeError(f"Unexpected Tool Dispatch Status: {outcome.status}")
         except UnknownToolOutcomeError as exc:
             # Do not turn an uncertain external outcome into a normal tool error.
             record_tool_call_trace(trace, start, current_step, call_id, tool_name, False, repr(exc))
