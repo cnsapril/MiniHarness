@@ -116,8 +116,9 @@ class PermissionApprovalTest(unittest.TestCase):
 
     def test_manager_invalid_ui_decision_stays_pending(self):
         item = self.call()
-        with self.assertRaises(ValueError):
-            self.manager.run_with_approval(item, lambda pending, recorded: "approve")
+        for invalid in ("approve", "APPROVE"):
+            with self.assertRaises(ValueError):
+                self.manager.run_with_approval(item, lambda pending, recorded: invalid)
         self.assertEqual(self.log.get_tool_approval("call-1", 0), "PENDING")
         self.assertEqual(self.log.get_tool_execution("call-1")["state"], "RECORDED")
         self.assertEqual(self.calls, [])

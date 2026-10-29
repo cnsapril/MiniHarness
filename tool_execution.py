@@ -29,7 +29,7 @@ class ToolDispatchStatus(str, Enum):
     DENIED = "DENIED"
 
 
-class ApprovalDecision(str, Enum):
+class ApprovalDecision(Enum):
     APPROVE = "APPROVE"
     REJECT = "REJECT"
 
