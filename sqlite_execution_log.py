@@ -2,6 +2,7 @@ import json
 import sqlite3
 
 from context_manager import ContextHelper
+from permission import DenialSource
 from tool_model import ToolInteraction
 
 
@@ -139,44 +140,30 @@ class SQLiteExecutionLog:
         ).fetchone()
         return row[0] if row else None
 
-    def create_pending_approval(self, call_id: str, expected_started_count: int,
-                                *, retry: bool = False) -> None:
-        """Create one approval request; duplicate attempts are NOT silently ignored.
+    def create_pending_approval(self, call_id: str,
+                                expected_started_count: int) -> None:
+        """Insert a distinct Approval record. No execution-state checks here.
 
-        Existing PENDING/APPROVED approvals are read separately by the Manager.
-        The INSERT is conditional on the current execution state and version.
+        The FK establishes call identity; execution admission is separately
+        governed by the tool_executions CAS + approval consumption transaction.
         """
-        expected_state = "RETRY_READY" if retry else "RECORDED"
         with self.conn:
-            inserted = self.conn.execute(
+            self.conn.execute(
                 """INSERT INTO tool_approvals(
                        session_id, call_id, expected_started_count, status)
-                   SELECT session_id, call_id, started_count, 'PENDING'
-                   FROM tool_executions
-                   WHERE session_id = ? AND call_id = ?
-                     AND state = ? AND started_count = ?""",
-                (self.session_id, call_id, expected_state, expected_started_count)
+                   VALUES (?, ?, ?, 'PENDING')""",
+                (self.session_id, call_id, expected_started_count)
             )
-            if inserted.rowcount != 1:
-                raise ValueError(f"Cannot request approval for {call_id}")
 
-    def approve_tool_execution(self, call_id: str, expected_started_count: int,
-                               *, retry: bool = False) -> None:
-        """Trusted user decision: persist APPROVED, not STARTED."""
-        expected_state = "RETRY_READY" if retry else "RECORDED"
+    def approve_tool_execution(self, call_id: str,
+                               expected_started_count: int) -> None:
+        """Only advance the Approval state machine; do not claim execution."""
         with self.conn:
             updated = self.conn.execute(
                 """UPDATE tool_approvals SET status = 'APPROVED'
                    WHERE session_id = ? AND call_id = ?
-                     AND expected_started_count = ? AND status = 'PENDING'
-                     AND EXISTS (
-                         SELECT 1 FROM tool_executions
-                         WHERE session_id = tool_approvals.session_id
-                           AND call_id = tool_approvals.call_id
-                           AND state = ? AND started_count = ?
-                     )""",
-                (self.session_id, call_id, expected_started_count,
-                 expected_state, expected_started_count)
+                     AND expected_started_count = ? AND status = 'PENDING'""",
+                (self.session_id, call_id, expected_started_count)
             )
             if updated.rowcount != 1:
                 raise ValueError(f"Approval no longer pending for {call_id}")
@@ -221,7 +208,7 @@ class SQLiteExecutionLog:
 
     def append_tool_denial(self, interaction: ToolInteraction,
                            expected_started_count: int, *,
-                           retry: bool = False, rejected_approval: bool = False) -> None:
+                           retry: bool = False, denial_source: DenialSource = DenialSource.POLICY) -> None:
         """Atomically deny an unstarted attempt, including the final output and ledger.
 
         A retry DENIED means retry denied, NOT proof earlier external effects
@@ -230,7 +217,7 @@ class SQLiteExecutionLog:
         expected_state = "RETRY_READY" if retry else "RECORDED"
         payload = interaction.to_payload()
         with self.conn:
-            if rejected_approval:
+            if denial_source == DenialSource.USER:
                 updated = self.conn.execute(
                     """UPDATE tool_approvals SET status = 'REJECTED'
                        WHERE session_id = ? AND call_id = ?

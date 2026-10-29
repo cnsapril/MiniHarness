@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from context_manager import ContextBudget, ContextManager
-from permission import PermissionPolicy, PermissionRequirement
+from permission import DenialSource, PermissionPolicy, PermissionRequirement
 from session import AgentSession
 from sqlite_execution_log import SQLiteExecutionLog
 from tool_execution import (ApprovalDecision, ToolDispatchStatus, RecoveryInspector,
@@ -60,7 +60,7 @@ class PermissionApprovalTest(unittest.TestCase):
         if outcome.status == ToolDispatchStatus.DENIED:
             self.session.record_tool_denial(
                 outcome.interaction, outcome.expected_started_count, retry=outcome.retry,
-                rejected_approval=outcome.rejected_approval,
+                denial_source=outcome.denial_source,
             )
         else:
             self.session.record_tool_interaction(outcome.interaction, outcome.started_count)
@@ -145,19 +145,38 @@ class PermissionApprovalTest(unittest.TestCase):
         finally:
             other_log.close()
 
-    def test_create_approval_checks_state_and_started_count(self):
+    def test_approval_crud_does_not_own_execution_state(self):
         item = self.call()
+        # Approval persistence identifies a recorded call, not a runnable attempt.
+        # Admission CAS is the only authority for execution state/version.
+        self.log.create_pending_approval("call-1", 1)
+        self.assertEqual(self.log.get_tool_approval("call-1", 1), "PENDING")
+        self.log.approve_tool_execution("call-1", 1)
+        self.assertEqual(self.log.get_tool_approval("call-1", 1), "APPROVED")
         with self.assertRaises(ValueError):
-            self.log.create_pending_approval("call-1", 1)
-        self.assertIsNone(self.log.get_tool_approval("call-1", 0))
+            self.log.acquire_tool_execution("call-1", 1, require_approval=True)
+        self.assertEqual(self.log.get_tool_approval("call-1", 1), "APPROVED")
+        self.assertEqual(self.log.get_tool_execution("call-1")["state"], "RECORDED")
+        self.assertEqual(self.log.get_tool_execution("call-1")["started_count"], 0)
+        self.assertEqual(self.calls, [])
+        # The Manager still creates the actual first-attempt approval (count=0).
+        self.assertEqual(self.manager.execute(item).status,
+                         ToolDispatchStatus.APPROVAL_PENDING)
+        self.assertEqual(self.log.get_tool_approval("call-1", 0), "PENDING")
+
+    def test_approval_foreign_key_rejects_unknown_call(self):
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.log.create_pending_approval("does-not-exist", 0)
+
+    def test_approval_manager_rejects_stale_execution_state(self):
+        item = self.call()
         self.assertEqual(self.manager.execute(item).status,
                          ToolDispatchStatus.APPROVAL_PENDING)
         self.manager.approve("call-1", expected_started_count=0)
-        result = self.manager.execute(item)
-        self.assertEqual(result.status, ToolDispatchStatus.COMPLETED)
-        with self.assertRaises(ValueError):
-            self.log.create_pending_approval("call-1", 1)
-        self.commit(result)
+        outcome = self.manager.execute(item)
+        with self.assertRaises(UnsafeToolRetryError):
+            self.manager.approve("call-1", expected_started_count=0)
+        self.commit(outcome)
 
     def test_approval_and_cas_are_atomic_and_single_use(self):
         item = self.call()
@@ -205,6 +224,22 @@ class PermissionApprovalTest(unittest.TestCase):
             self.manager.execute(item)
         self.assertEqual(self.log.get_tool_approval("call-1", 0), "APPROVED")
         self.assertEqual(self.log.get_tool_execution("call-1")["state"], "RECORDED")
+        self.assertEqual(self.calls, [])
+
+    def test_denial_source_distinguishes_user_from_policy(self):
+        user_call = self.call(call_id="user-reject")
+        self.assertEqual(self.manager.execute(user_call).status,
+                         ToolDispatchStatus.APPROVAL_PENDING)
+        denied = self.manager.reject(user_call, expected_started_count=0)
+        self.assertEqual(denied.denial_source, DenialSource.USER)
+        self.commit(denied)
+        self.assertEqual(self.log.get_tool_approval("user-reject", 0), "REJECTED")
+
+        policy_call = self.call(tool="blocked", call_id="policy-deny")
+        denied_by_policy = self.manager.execute(policy_call)
+        self.assertEqual(denied_by_policy.denial_source, DenialSource.POLICY)
+        self.commit(denied_by_policy)
+        self.assertIsNone(self.log.get_tool_approval("policy-deny", 0))
         self.assertEqual(self.calls, [])
 
     def test_rejection_is_atomic_with_denied_event_and_ledger(self):

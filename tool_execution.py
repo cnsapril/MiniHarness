@@ -10,7 +10,7 @@ from enum import Enum
 from typing import Callable, ClassVar
 
 from context_manager import ContextHelper
-from permission import PermissionPolicy, PermissionRequirement
+from permission import DenialSource, PermissionPolicy, PermissionRequirement
 from tool_model import ToolInteraction
 from tool_registry import PROJECT_ROOT, ToolRegistry, ToolSafety
 
@@ -116,7 +116,7 @@ class ToolDenialOutcome:
     reason: str
     expected_started_count: int
     retry: bool
-    rejected_approval: bool
+    denial_source: DenialSource
 
 
 class ToolExecutionManager:
@@ -157,13 +157,14 @@ class ToolExecutionManager:
                 retry: bool = False) -> None:
         """Call only from a trusted user-interface approval decision."""
         record = self.execution_log.get_tool_execution(call_id)
-        if record is None or record["started_count"] != expected_started_count:
+        if (record is None or record["started_count"] != expected_started_count
+                or record["state"] != ("RETRY_READY" if retry else "RECORDED")):
             raise UnsafeToolRetryError(f"Stale approval: {call_id}")
         _, _, decision = self._permission(record)
         if decision.requirement != PermissionRequirement.ASK:
             raise UnsafeToolRetryError(f"Tool does not require approval: {call_id}")
         self.execution_log.approve_tool_execution(
-            call_id, expected_started_count, retry=retry
+            call_id, expected_started_count
         )
 
     def reject(self, tool_call, *, expected_started_count: int,
@@ -177,12 +178,12 @@ class ToolExecutionManager:
             raise UnsafeToolRetryError("No approval is required for this call")
         return self._prepare_denial(
             input_item, "User rejected this tool invocation",
-            expected_started_count, retry, rejected_approval=True
+            expected_started_count, retry, denial_source=DenialSource.USER
         )
 
     @staticmethod
     def _prepare_denial(input_item, reason: str, count: int, retry: bool,
-                        *, rejected_approval: bool = False) -> ToolDenialOutcome:
+                        *, denial_source: DenialSource = DenialSource.POLICY) -> ToolDenialOutcome:
         # A retry denial does not imply the earlier execution had no effects.
         result = {
             "error": "PERMISSION_DENIED",
@@ -197,7 +198,7 @@ class ToolExecutionManager:
             call_id=input_item["call_id"], input=input_item, output=output_item
         )
         return ToolDenialOutcome(
-            interaction, reason, count, retry, rejected_approval
+            interaction, reason, count, retry, denial_source
         )
 
     def authorize_retry(self, call_id: str, *, expected_started_count: int) -> None:
@@ -227,6 +228,11 @@ class ToolExecutionManager:
         if retry and safety != ToolSafety.READ_ONLY:
             raise UnsafeToolRetryError(f"Retry forbidden for {record['tool_name']}")
         expected_count = record["started_count"]
+        expected_state = "RETRY_READY" if retry else "RECORDED"
+        if record["state"] != expected_state:
+            raise UnsafeToolRetryError(
+                f"Tool call {call_id} is {record['state']}, expected {expected_state}"
+            )
 
         if decision.requirement == PermissionRequirement.DENY:
             return self._prepare_denial(
@@ -240,7 +246,7 @@ class ToolExecutionManager:
                 # rather than being silently swallowed by INSERT OR IGNORE.
                 try:
                     self.execution_log.create_pending_approval(
-                        call_id, expected_count, retry=retry
+                        call_id, expected_count
                     )
                 except ValueError as exc:
                     raise UnsafeToolRetryError(str(exc)) from exc

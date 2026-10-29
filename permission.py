@@ -14,6 +14,12 @@ class PermissionRequirement(str, Enum):
     DENY = "DENY"
 
 
+class DenialSource(str, Enum):
+    """Why the tool call was denied; distinct from its execution state."""
+    POLICY = "POLICY"
+    USER = "USER"
+
+
 @dataclass(frozen=True)
 class PermissionDecision:
     requirement: PermissionRequirement

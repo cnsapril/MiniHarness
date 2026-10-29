@@ -139,7 +139,7 @@ def execute_function_calls(session: AgentSession, executor: ToolExecutionManager
             if outcome.status == ToolDispatchStatus.DENIED:
                 session.record_tool_denial(
                     outcome.interaction, outcome.expected_started_count,
-                    retry=outcome.retry, rejected_approval=outcome.rejected_approval,
+                    retry=outcome.retry, denial_source=outcome.denial_source,
                 )
                 record_tool_call_trace(
                     trace, start, current_step, call_id, tool_name, False,
