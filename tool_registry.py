@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from enum import Enum
 import os
 import stat
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Callable
 from uuid import uuid4
 
@@ -23,6 +23,7 @@ class ToolSpec:
     description: str
     parameters: dict
     permission: PermissionRequirement = PermissionRequirement.DENY
+    permission_check: Callable[[dict, Path], str | None] | None = None
 
     def llm_schema(self) -> dict:
         return {
@@ -50,6 +51,36 @@ class ToolRegistry:
 
 
 PROJECT_ROOT = Path.cwd().resolve()
+
+def workspace_path_permission_check(arguments: dict, root: Path) -> str | None:
+    """Tool-owned read/write path policy, not a generic PermissionPolicy rule."""
+    path = arguments.get("path")
+    if not isinstance(path, str) or not path or "\x00" in path:
+        return "Invalid workspace path"
+    rel = Path(path)
+    if (rel.is_absolute() or PureWindowsPath(path).is_absolute()
+            or ".." in rel.parts or "\\" in path):
+        return "Path outside workspace policy"
+    if any(part == ".git" or part == ".env" or part.startswith(".env.")
+           for part in rel.parts):
+        return "Protected workspace path"
+    if not (root / rel).resolve().is_relative_to(root):
+        return "Path outside workspace"
+    return None
+
+
+def write_file_permission_check(arguments: dict, root: Path) -> str | None:
+    """Additional write-specific rules; called by the trusted ToolSpec."""
+    reason = workspace_path_permission_check(arguments, root)
+    if reason:
+        return reason
+    if Path(arguments["path"]) == Path("."):
+        return "Expected a file path"
+    content = arguments.get("content")
+    if not isinstance(content, str) or len(content.encode("utf-8")) > 128 * 1024:
+        return "Invalid or oversized content"
+    return None
+
 
 
 def list_files(path: str) -> list[str]:
@@ -121,6 +152,7 @@ def default_tool_registry() -> ToolRegistry:
             handler=list_files,
             safety=ToolSafety.READ_ONLY,
             permission=PermissionRequirement.ALLOW,
+            permission_check=workspace_path_permission_check,
             description="List files and directories under a given path.",
             parameters={
                 "type": "object",
@@ -139,6 +171,7 @@ def default_tool_registry() -> ToolRegistry:
             handler=write_file,
             safety=ToolSafety.SIDE_EFFECTING,
             permission=PermissionRequirement.ASK,
+            permission_check=write_file_permission_check,
             description="Write a UTF-8 file under the project workspace after user approval.",
             parameters={
                 "type": "object",

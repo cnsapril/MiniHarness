@@ -14,7 +14,7 @@ from logging_config import setup_logging
 from session import AgentSession
 from sqlite_execution_log import SQLiteExecutionLog
 from trace_model import AgentTrace, LLMCallTrace, ToolCallTrace, AgentStatus
-from tool_execution import (ApprovalRequiredError, RecoveryInspector, ToolDenialOutcome,
+from tool_execution import (ToolApprovalPending, RecoveryInspector, ToolDenialOutcome,
                             ToolExecutionManager, UnknownToolOutcomeError)
 from tool_registry import default_tool_registry
 
@@ -125,24 +125,26 @@ def execute_function_calls(session: AgentSession, executor: ToolExecutionManager
         call_id = item.call_id
         logger.info("[Tool Call] %s: %s", tool_name, item.arguments)
         try:
-            try:
-                outcome = executor.execute(item)
-            except ApprovalRequiredError as pending:
-                # Only the trusted local CLI can make this decision; never the LLM.
+            outcome = executor.execute(item)
+            if isinstance(outcome, ToolApprovalPending):
+                # Pending approval is normal workflow state, not an exception.
+                # Only trusted CLI input can approve; never accept LLM-supplied approval.
                 print(f"\nApproval requested for {tool_name} (call_id={call_id}, "
-                      f"attempt={pending.expected_started_count + 1})")
+                      f"attempt={outcome.expected_started_count + 1})")
                 print(f"Arguments: {item.arguments}")
                 approved = input("Approve this exact tool call? [y/N]: ").strip().lower() in ("y", "yes")
                 if approved:
                     executor.approve(
-                        pending.call_id, expected_started_count=pending.expected_started_count,
-                        retry=pending.retry,
+                        outcome.call_id, expected_started_count=outcome.expected_started_count,
+                        retry=outcome.retry,
                     )
-                    outcome = executor.execute(item, retry=pending.retry)
+                    outcome = executor.execute(item, retry=outcome.retry)
+                    if isinstance(outcome, ToolApprovalPending):
+                        raise RuntimeError("Approved tool call unexpectedly remains pending")
                 else:
                     outcome = executor.reject(
-                        item, expected_started_count=pending.expected_started_count,
-                        retry=pending.retry,
+                        item, expected_started_count=outcome.expected_started_count,
+                        retry=outcome.retry,
                     )
 
             if isinstance(outcome, ToolDenialOutcome):

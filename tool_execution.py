@@ -26,16 +26,6 @@ class UnsafeToolRetryError(RuntimeError):
     """Tool execution permission or explicit retry authorization was denied."""
 
 
-class ApprovalRequiredError(RuntimeError):
-    """A user must approve this exact recorded invocation before execution."""
-
-    def __init__(self, call_id: str, expected_started_count: int, retry: bool):
-        self.call_id = call_id
-        self.expected_started_count = expected_started_count
-        self.retry = retry
-        super().__init__(f"Approval pending for {call_id} (version {expected_started_count})")
-
-
 class UnknownToolOutcomeError(RuntimeError):
     """A side-effecting tool may have taken effect; stop rather than auto-retry."""
 
@@ -95,6 +85,14 @@ class ToolExecutionOutcome:
     handler_returned_normally: bool
     error: str | None
     started_count: int
+
+
+@dataclass(frozen=True)
+class ToolApprovalPending:
+    """Ordinary control-flow outcome: an approval is needed before execution."""
+    call_id: str
+    expected_started_count: int
+    retry: bool
 
 
 @dataclass(frozen=True)
@@ -205,7 +203,7 @@ class ToolExecutionManager:
             raise UnsafeToolRetryError(str(exc)) from exc
 
     def execute(self, tool_call, *, retry: bool = False
-                ) -> ToolExecutionOutcome | ToolDenialOutcome:
+                ) -> ToolExecutionOutcome | ToolDenialOutcome | ToolApprovalPending:
         """Permission gateway then durable CAS; no Handler runs on ASK or DENY."""
         input_item, record = self._recorded(tool_call)
         call_id = input_item["call_id"]
@@ -228,7 +226,7 @@ class ToolExecutionManager:
             except ValueError as exc:
                 raise UnsafeToolRetryError(str(exc)) from exc
             if status == "PENDING":
-                raise ApprovalRequiredError(call_id, expected_count, retry)
+                return ToolApprovalPending(call_id, expected_count, retry)
             if status != "APPROVED":
                 raise UnsafeToolRetryError(f"Approval is not usable: {call_id}")
 

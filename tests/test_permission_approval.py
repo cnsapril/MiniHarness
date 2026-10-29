@@ -11,9 +11,10 @@ from context_manager import ContextBudget, ContextManager
 from permission import PermissionPolicy, PermissionRequirement
 from session import AgentSession
 from sqlite_execution_log import SQLiteExecutionLog
-from tool_execution import (ApprovalRequiredError, RecoveryInspector, ToolDenialOutcome,
+from tool_execution import (ToolApprovalPending, RecoveryInspector, ToolDenialOutcome,
                             ToolExecutionManager, ToolPhase, UnsafeToolRetryError)
-from tool_registry import ToolRegistry, ToolSafety, ToolSpec, write_file
+from tool_registry import (ToolRegistry, ToolSafety, ToolSpec, write_file,
+                           write_file_permission_check, workspace_path_permission_check)
 
 
 class PermissionApprovalTest(unittest.TestCase):
@@ -36,7 +37,8 @@ class PermissionApprovalTest(unittest.TestCase):
             ToolSpec("sensitive_read", handler, ToolSafety.READ_ONLY, "Sensitive", {},
                      permission=PermissionRequirement.ASK),
             ToolSpec("write_file", handler, ToolSafety.SIDE_EFFECTING, "Write", {},
-                     permission=PermissionRequirement.ASK),
+                     permission=PermissionRequirement.ASK,
+                     permission_check=write_file_permission_check),
             ToolSpec("blocked", handler, ToolSafety.SIDE_EFFECTING, "Blocked", {},
                      permission=PermissionRequirement.DENY),
         ])
@@ -65,14 +67,13 @@ class PermissionApprovalTest(unittest.TestCase):
 
     def test_pending_is_durable_and_does_not_run_handler(self):
         item = self.call()
-        with self.assertRaises(ApprovalRequiredError) as pending:
-            self.manager.execute(item)
-        self.assertEqual(pending.exception.expected_started_count, 0)
+        pending = self.manager.execute(item)
+        self.assertIsInstance(pending, ToolApprovalPending)
+        self.assertEqual(pending.expected_started_count, 0)
         self.assertEqual(self.log.get_tool_approval("call-1", 0), "PENDING")
         self.assertEqual(self.log.get_tool_execution("call-1")["state"], "RECORDED")
         self.assertEqual(self.calls, [])
-        with self.assertRaises(ApprovalRequiredError):
-            self.manager.execute(item)
+        self.assertIsInstance(self.manager.execute(item), ToolApprovalPending)
         other_log = SQLiteExecutionLog(str(self.root / "state.sqlite"), "session-1")
         try:
             self.assertEqual(other_log.get_tool_approval("call-1", 0), "PENDING")
@@ -81,8 +82,7 @@ class PermissionApprovalTest(unittest.TestCase):
 
     def test_approval_and_cas_are_atomic_and_single_use(self):
         item = self.call()
-        with self.assertRaises(ApprovalRequiredError):
-            self.manager.execute(item)
+        self.assertIsInstance(self.manager.execute(item), ToolApprovalPending)
         self.manager.approve("call-1", expected_started_count=0)
         self.assertEqual(self.log.get_tool_approval("call-1", 0), "APPROVED")
         self.assertEqual(self.log.get_tool_execution("call-1")["state"], "RECORDED")
@@ -100,8 +100,7 @@ class PermissionApprovalTest(unittest.TestCase):
 
     def test_two_managers_cannot_consume_same_approval(self):
         item = self.call()
-        with self.assertRaises(ApprovalRequiredError):
-            self.manager.execute(item)
+        self.assertIsInstance(self.manager.execute(item), ToolApprovalPending)
         self.manager.approve("call-1", expected_started_count=0)
         other_log = SQLiteExecutionLog(str(self.root / "state.sqlite"), "session-1")
         try:
@@ -116,8 +115,7 @@ class PermissionApprovalTest(unittest.TestCase):
 
     def test_db_failure_does_not_consume_approval_or_execute(self):
         item = self.call()
-        with self.assertRaises(ApprovalRequiredError):
-            self.manager.execute(item)
+        self.assertIsInstance(self.manager.execute(item), ToolApprovalPending)
         self.manager.approve("call-1", expected_started_count=0)
         self.log.conn.execute("""
             CREATE TRIGGER abort_start BEFORE UPDATE OF state ON tool_executions
@@ -132,8 +130,7 @@ class PermissionApprovalTest(unittest.TestCase):
 
     def test_rejection_is_atomic_with_denied_event_and_ledger(self):
         item = self.call()
-        with self.assertRaises(ApprovalRequiredError):
-            self.manager.execute(item)
+        self.assertIsInstance(self.manager.execute(item), ToolApprovalPending)
         denied = self.manager.reject(item, expected_started_count=0)
         self.assertEqual(self.log.get_tool_approval("call-1", 0), "PENDING")
         self.commit(denied)
@@ -149,8 +146,7 @@ class PermissionApprovalTest(unittest.TestCase):
 
     def test_rejection_rolls_back_on_ledger_failure(self):
         item = self.call()
-        with self.assertRaises(ApprovalRequiredError):
-            self.manager.execute(item)
+        self.assertIsInstance(self.manager.execute(item), ToolApprovalPending)
         denied = self.manager.reject(item, expected_started_count=0)
         self.log.conn.execute("""
             CREATE TRIGGER abort_denial BEFORE INSERT ON tool_interactions
@@ -199,15 +195,14 @@ class PermissionApprovalTest(unittest.TestCase):
 
     def test_approval_cannot_be_reused_for_retry(self):
         item = self.call("sensitive_read")
-        with self.assertRaises(ApprovalRequiredError):
-            self.manager.execute(item)
+        self.assertIsInstance(self.manager.execute(item), ToolApprovalPending)
         self.manager.approve("call-1", expected_started_count=0)
         first = self.manager.execute(item)
         self.assertEqual(first.started_count, 1)
         self.manager.authorize_retry("call-1", expected_started_count=1)
-        with self.assertRaises(ApprovalRequiredError) as retry:
-            self.manager.execute(item, retry=True)
-        self.assertEqual(retry.exception.expected_started_count, 1)
+        pending_retry = self.manager.execute(item, retry=True)
+        self.assertIsInstance(pending_retry, ToolApprovalPending)
+        self.assertEqual(pending_retry.expected_started_count, 1)
         self.assertEqual(self.log.get_tool_approval("call-1", 0), "CONSUMED")
         self.assertEqual(self.log.get_tool_approval("call-1", 1), "PENDING")
         self.assertEqual(len(self.calls), 1)
@@ -221,13 +216,11 @@ class PermissionApprovalTest(unittest.TestCase):
 
     def test_rejected_retry_preserves_unknown_previous_outcome(self):
         item = self.call("sensitive_read")
-        with self.assertRaises(ApprovalRequiredError):
-            self.manager.execute(item)
+        self.assertIsInstance(self.manager.execute(item), ToolApprovalPending)
         self.manager.approve("call-1", expected_started_count=0)
         self.manager.execute(item)  # STARTED; no durable result
         self.manager.authorize_retry("call-1", expected_started_count=1)
-        with self.assertRaises(ApprovalRequiredError):
-            self.manager.execute(item, retry=True)
+        self.assertIsInstance(self.manager.execute(item, retry=True), ToolApprovalPending)
         rejected = self.manager.reject(item, expected_started_count=1, retry=True)
         self.commit(rejected)
         self.assertEqual(self.log.get_tool_execution("call-1")["state"], "DENIED")
@@ -238,8 +231,7 @@ class PermissionApprovalTest(unittest.TestCase):
 
     def test_denial_version_cas_prevents_stale_rejection(self):
         item = self.call("sensitive_read")
-        with self.assertRaises(ApprovalRequiredError):
-            self.manager.execute(item)
+        self.assertIsInstance(self.manager.execute(item), ToolApprovalPending)
         denied = self.manager.reject(item, expected_started_count=0)
         self.manager.approve("call-1", expected_started_count=0)
         outcome = self.manager.execute(item)
@@ -249,6 +241,42 @@ class PermissionApprovalTest(unittest.TestCase):
         self.assertEqual(self.log.get_events(), before)
         self.assertEqual(self.log.get_tool_approval("call-1", 0), "CONSUMED")
         self.commit(outcome)
+
+    def test_policy_delegates_to_each_tool_spec_not_tool_name(self):
+        def reject_specific_args(args, root):
+            return "Too many records" if args.get("limit", 0) > 5 else None
+
+        spec = ToolSpec(
+            "report_query", lambda **kw: None, ToolSafety.READ_ONLY,
+            "Read reports", {}, permission=PermissionRequirement.ALLOW,
+            permission_check=reject_specific_args,
+        )
+        policy = PermissionPolicy(self.root)
+        self.assertEqual(policy.evaluate(spec, {"limit": 6}).requirement,
+                         PermissionRequirement.DENY)
+        self.assertEqual(policy.evaluate(spec, {"limit": 3}).requirement,
+                         PermissionRequirement.ALLOW)
+        self.assertEqual(policy.evaluate(spec, {"limit": 6}).reason, "Too many records")
+        # Names are irrelevant to the generic policy.
+        unsafe_name = ToolSpec(
+            "write_file", lambda **kw: None, ToolSafety.SIDE_EFFECTING,
+            "Different handler", {}, permission=PermissionRequirement.ALLOW,
+        )
+        self.assertEqual(policy.evaluate(unsafe_name, {"path": "../outside"}).requirement,
+                         PermissionRequirement.ALLOW)
+
+    def test_tool_specific_rules_reject_bad_paths_and_oversized_content(self):
+        policy = PermissionPolicy(self.root)
+        read = ToolSpec("read_any", lambda **kw: None, ToolSafety.READ_ONLY, "", {},
+                        permission=PermissionRequirement.ALLOW,
+                        permission_check=workspace_path_permission_check)
+        write = self.registry.get("write_file")
+        self.assertEqual(policy.evaluate(read, {"path": "../outside"}).requirement,
+                         PermissionRequirement.DENY)
+        self.assertEqual(policy.evaluate(write, {"path": "x.txt", "content": "x" * 131073}).requirement,
+                         PermissionRequirement.DENY)
+        self.assertEqual(policy.evaluate(write, {"path": "x.txt", "content": "okay"}).requirement,
+                         PermissionRequirement.ASK)
 
     def test_workspace_handler_does_not_follow_symlinks(self):
         (self.root / "real").mkdir()
@@ -262,8 +290,7 @@ class PermissionApprovalTest(unittest.TestCase):
 
     def test_approved_arguments_cannot_be_swapped(self):
         item = self.call()
-        with self.assertRaises(ApprovalRequiredError):
-            self.manager.execute(item)
+        self.assertIsInstance(self.manager.execute(item), ToolApprovalPending)
         self.manager.approve("call-1", expected_started_count=0)
         modified = dict(item)
         modified["arguments"] = json.dumps({"path": "another.txt", "content": "evil"})
