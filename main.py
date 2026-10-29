@@ -14,7 +14,8 @@ from logging_config import setup_logging
 from session import AgentSession
 from sqlite_execution_log import SQLiteExecutionLog
 from trace_model import AgentTrace, LLMCallTrace, ToolCallTrace, AgentStatus
-from tool_execution import RecoveryInspector, ToolExecutionManager, UnknownToolOutcomeError
+from tool_execution import (ApprovalDecision, RecoveryInspector, ToolDispatchStatus,
+                            ToolExecutionManager, UnknownToolOutcomeError)
 from tool_registry import default_tool_registry
 
 logger = logging.getLogger(__name__)
@@ -108,6 +109,15 @@ def record_tool_call_trace(trace: AgentTrace, start: float, current_step: int, c
     ))
 
 
+def cli_approval_provider(pending, recorded_input: dict) -> ApprovalDecision:
+    """Only the trusted CLI gathers user consent; it does not mutate execution state."""
+    print(f"\nApproval requested for {recorded_input['name']} "
+          f"(call_id={pending.call_id}, attempt={pending.expected_started_count + 1})")
+    print(f"Arguments: {recorded_input['arguments']}")
+    approved = input("Approve this exact tool call? [y/N]: ").strip().lower() in ("y", "yes")
+    return ApprovalDecision.APPROVE if approved else ApprovalDecision.REJECT
+
+
 def execute_function_calls(session: AgentSession, executor: ToolExecutionManager, response,
                            total_tool_calls: int, current_step: int, trace: AgentTrace) -> int:
     tool_call_count = 0
@@ -124,17 +134,32 @@ def execute_function_calls(session: AgentSession, executor: ToolExecutionManager
         call_id = item.call_id
         logger.info("[Tool Call] %s: %s", tool_name, item.arguments)
         try:
-            outcome = executor.execute(item)
-            # State CAS + output event + pair ledger commit atomically via Session.
-            session.record_tool_interaction(outcome.interaction, outcome.started_count)
+            outcome = executor.run_with_approval(item, cli_approval_provider)
+
+            if outcome.status == ToolDispatchStatus.DENIED:
+                session.record_tool_denial(
+                    outcome.interaction, outcome.expected_started_count,
+                    retry=outcome.retry, denial_source=outcome.denial_source,
+                )
+                record_tool_call_trace(
+                    trace, start, current_step, call_id, tool_name, False,
+                    f"PERMISSION_DENIED: {outcome.reason}",
+                )
+                logger.info("[Tool Denied] %s", outcome.reason)
+            elif outcome.status == ToolDispatchStatus.COMPLETED:
+                # State CAS + output event + ledger commit atomically via Session.
+                session.record_tool_interaction(outcome.interaction, outcome.started_count)
+                record_tool_call_trace(
+                    trace, start, current_step, call_id,
+                    tool_name, outcome.handler_returned_normally, outcome.error,
+                )
+                logger.info("[Tool Result] %s", outcome.result)
+            else:
+                raise RuntimeError(f"Unexpected Tool Dispatch Status: {outcome.status}")
         except UnknownToolOutcomeError as exc:
             # Do not turn an uncertain external outcome into a normal tool error.
             record_tool_call_trace(trace, start, current_step, call_id, tool_name, False, repr(exc))
             raise
-
-        record_tool_call_trace(trace, start, current_step, call_id,
-                               tool_name, outcome.handler_returned_normally, outcome.error)
-        logger.info("[Tool Result] %s", outcome.result)
         tool_call_count += 1
 
     return tool_call_count

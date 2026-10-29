@@ -2,6 +2,7 @@ import json
 import sqlite3
 
 from context_manager import ContextHelper
+from permission import DenialSource
 from tool_model import ToolInteraction
 
 
@@ -47,7 +48,7 @@ class SQLiteExecutionLog:
                 tool_name TEXT NOT NULL,
                 input_json TEXT NOT NULL,
                 state TEXT NOT NULL CHECK(
-                    state IN ('RECORDED', 'STARTED', 'RETRY_READY', 'RESULT_RECORDED')
+                    state IN ('RECORDED', 'STARTED', 'RETRY_READY', 'RESULT_RECORDED', 'DENIED')
                 ),
                 started_count INTEGER NOT NULL DEFAULT 0 CHECK(started_count >= 0),
                 PRIMARY KEY (session_id, call_id)
@@ -56,6 +57,19 @@ class SQLiteExecutionLog:
         self.conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_tool_executions_pending
             ON tool_executions(session_id, state)
+        """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS tool_approvals (
+                session_id TEXT NOT NULL,
+                call_id TEXT NOT NULL,
+                expected_started_count INTEGER NOT NULL CHECK(expected_started_count >= 0),
+                status TEXT NOT NULL CHECK(
+                    status IN ('PENDING', 'APPROVED', 'CONSUMED', 'REJECTED')
+                ),
+                PRIMARY KEY (session_id, call_id, expected_started_count),
+                FOREIGN KEY (session_id, call_id)
+                  REFERENCES tool_executions(session_id, call_id)
+            )
         """)
         self.conn.commit()
 
@@ -118,11 +132,57 @@ class SQLiteExecutionLog:
             for row in rows
         ]
 
+    def get_tool_approval(self, call_id: str, expected_started_count: int) -> str | None:
+        row = self.conn.execute(
+            """SELECT status FROM tool_approvals
+               WHERE session_id = ? AND call_id = ? AND expected_started_count = ?""",
+            (self.session_id, call_id, expected_started_count)
+        ).fetchone()
+        return row[0] if row else None
+
+    def create_pending_approval(self, call_id: str,
+                                expected_started_count: int) -> None:
+        """Insert a distinct Approval record. No execution-state checks here.
+
+        The FK establishes call identity; execution admission is separately
+        governed by the tool_executions CAS + approval consumption transaction.
+        """
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO tool_approvals(
+                       session_id, call_id, expected_started_count, status)
+                   VALUES (?, ?, ?, 'PENDING')""",
+                (self.session_id, call_id, expected_started_count)
+            )
+
+    def approve_tool_execution(self, call_id: str,
+                               expected_started_count: int) -> None:
+        """Only advance the Approval state machine; do not claim execution."""
+        with self.conn:
+            updated = self.conn.execute(
+                """UPDATE tool_approvals SET status = 'APPROVED'
+                   WHERE session_id = ? AND call_id = ?
+                     AND expected_started_count = ? AND status = 'PENDING'""",
+                (self.session_id, call_id, expected_started_count)
+            )
+            if updated.rowcount != 1:
+                raise ValueError(f"Approval no longer pending for {call_id}")
+
     def acquire_tool_execution(self, call_id: str, expected_started_count: int,
-                               *, retry: bool = False) -> int:
-        """Atomic optimistic-lock admission; returns the newly granted version."""
+                               *, retry: bool = False,
+                               require_approval: bool = False) -> int:
+        """Consume Approval (if required) and grant STARTED with the same CAS transaction."""
         expected_state = "RETRY_READY" if retry else "RECORDED"
         with self.conn:
+            if require_approval:
+                updated = self.conn.execute(
+                    """UPDATE tool_approvals SET status = 'CONSUMED'
+                       WHERE session_id = ? AND call_id = ?
+                         AND expected_started_count = ? AND status = 'APPROVED'""",
+                    (self.session_id, call_id, expected_started_count)
+                )
+                if updated.rowcount != 1:
+                    raise ValueError(f"Approval not granted for {call_id}")
             updated = self.conn.execute(
                 """UPDATE tool_executions
                    SET state = 'STARTED', started_count = started_count + 1
@@ -146,6 +206,49 @@ class SQLiteExecutionLog:
             if updated.rowcount != 1:
                 raise ValueError(f"Retry authorization rejected for {call_id}")
 
+    def append_tool_denial(self, interaction: ToolInteraction,
+                           expected_started_count: int, *,
+                           retry: bool = False, denial_source: DenialSource = DenialSource.POLICY) -> None:
+        """Atomically deny an unstarted attempt, including the final output and ledger.
+
+        A retry DENIED means retry denied, NOT proof earlier external effects
+        did not occur; started_count is intentionally preserved.
+        """
+        expected_state = "RETRY_READY" if retry else "RECORDED"
+        payload = interaction.to_payload()
+        with self.conn:
+            if denial_source == DenialSource.USER:
+                updated = self.conn.execute(
+                    """UPDATE tool_approvals SET status = 'REJECTED'
+                       WHERE session_id = ? AND call_id = ?
+                         AND expected_started_count = ? AND status = 'PENDING'""",
+                    (self.session_id, interaction.call_id, expected_started_count)
+                )
+                if updated.rowcount != 1:
+                    raise ValueError(f"Approval cannot be rejected: {interaction.call_id}")
+            updated = self.conn.execute(
+                """UPDATE tool_executions SET state = 'DENIED'
+                   WHERE session_id = ? AND call_id = ?
+                     AND state = ? AND started_count = ?""",
+                (self.session_id, interaction.call_id, expected_state, expected_started_count)
+            )
+            if updated.rowcount != 1:
+                raise ValueError(f"Denial rejected by execution CAS: {interaction.call_id}")
+            self._append_output_and_ledger(interaction, payload)
+
+    def _append_output_and_ledger(self, interaction: ToolInteraction, payload: dict) -> None:
+        """Caller must hold the enclosing transaction."""
+        cursor = self.conn.execute(
+            "INSERT INTO events(session_id, kind, payload) VALUES (?, ?, ?)",
+            (self.session_id, "history_items",
+             json.dumps({"items": [payload["output"]]}, ensure_ascii=False))
+        )
+        self.conn.execute(
+            "INSERT INTO tool_interactions(session_id, call_id, event_id, payload) VALUES (?, ?, ?, ?)",
+            (self.session_id, interaction.call_id, cursor.lastrowid,
+             json.dumps(payload, ensure_ascii=False))
+        )
+
     def append_tool_interaction(self, interaction: ToolInteraction,
                                 expected_started_count: int) -> None:
         """Atomically commit state, context-result event and pair ledger.
@@ -164,16 +267,7 @@ class SQLiteExecutionLog:
                 raise ValueError(
                     f"Stale or invalid tool result commit: {interaction.call_id}"
                 )
-            cursor = self.conn.execute(
-                "INSERT INTO events(session_id, kind, payload) VALUES (?, ?, ?)",
-                (self.session_id, "history_items",
-                 json.dumps({"items": [payload["output"]]}, ensure_ascii=False))
-            )
-            self.conn.execute(
-                "INSERT INTO tool_interactions(session_id, call_id, event_id, payload) VALUES (?, ?, ?, ?)",
-                (self.session_id, interaction.call_id, cursor.lastrowid,
-                 json.dumps(payload, ensure_ascii=False))
-            )
+            self._append_output_and_ledger(interaction, payload)
 
     def get_tool_interaction(self, call_id: str) -> ToolInteraction | None:
         row = self.conn.execute(

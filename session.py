@@ -1,6 +1,7 @@
 from copy import deepcopy
 
 from context_manager import ContextManager
+from permission import DenialSource
 from sqlite_execution_log import SQLiteExecutionLog
 from tool_model import ToolInteraction
 
@@ -65,6 +66,23 @@ class AgentSession:
         """Commit the STARTED version, output and ledger before updating context."""
         output_item = deepcopy(interaction.output)
         self.execution_log.append_tool_interaction(interaction, expected_started_count)
+        self._history.append(output_item)
+        try:
+            self.context_manager.append(self._history, [output_item])
+        except Exception:
+            self.context_manager.invalidate()
+            raise
+
+    def record_tool_denial(self, interaction: ToolInteraction,
+                           expected_started_count: int, *,
+                           retry: bool = False,
+                           denial_source: DenialSource = DenialSource.POLICY) -> None:
+        """Atomically persist denial and tool output before updating context."""
+        output_item = deepcopy(interaction.output)
+        self.execution_log.append_tool_denial(
+            interaction, expected_started_count, retry=retry,
+            denial_source=denial_source
+        )
         self._history.append(output_item)
         try:
             self.context_manager.append(self._history, [output_item])

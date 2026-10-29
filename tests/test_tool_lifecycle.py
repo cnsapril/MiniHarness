@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from context_manager import ContextBudget, ContextManager
+from permission import PermissionRequirement
 from session import AgentSession
 from sqlite_execution_log import SQLiteExecutionLog
 from tool_execution import (RecoveryInspector, ToolExecutionManager, ToolPhase,
@@ -27,9 +28,11 @@ class ToolLifecycleTest(unittest.TestCase):
         self.side_handler = lambda: None
         self.registry = ToolRegistry([
             ToolSpec("list_files", lambda path: self.read_handler(path),
-                     ToolSafety.READ_ONLY, "List files", {"type": "object"}),
+                     ToolSafety.READ_ONLY, "List files", {"type": "object"},
+                     permission=PermissionRequirement.ALLOW),
             ToolSpec("increment_counter", lambda: self.side_handler(),
-                     ToolSafety.SIDE_EFFECTING, "Increment", {"type": "object"}),
+                     ToolSafety.SIDE_EFFECTING, "Increment", {"type": "object"},
+                     permission=PermissionRequirement.ALLOW),
         ])
         self.manager = ToolExecutionManager(self.log, self.registry)
         self.session.append([{"role": "user", "content": "Run tool"}])
