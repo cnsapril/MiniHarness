@@ -260,6 +260,49 @@ class PermissionApprovalTest(unittest.TestCase):
             self.assertEqual(write_file("real/one.txt", "ok"), "real/one.txt")
             self.assertEqual((self.root / "real" / "one.txt").read_text(), "ok")
 
+    def test_approved_arguments_cannot_be_swapped(self):
+        item = self.call()
+        with self.assertRaises(ApprovalRequiredError):
+            self.manager.execute(item)
+        self.manager.approve("call-1", expected_started_count=0)
+        modified = dict(item)
+        modified["arguments"] = json.dumps({"path": "another.txt", "content": "evil"})
+        with self.assertRaises(UnsafeToolRetryError):
+            self.manager.execute(modified)
+        self.assertEqual(self.log.get_tool_approval("call-1", 0), "APPROVED")
+        self.assertEqual(self.log.get_tool_execution("call-1")["state"], "RECORDED")
+        self.assertEqual(self.calls, [])
+
+    def test_cli_approval_and_rejection_use_trusted_input(self):
+        from types import SimpleNamespace
+        from main import execute_function_calls
+        from trace_model import AgentTrace
+
+        # The SDK supplies model_dump and attribute access; emulate that here.
+        item = self.call(call_id="approved")
+        sdk_item = SimpleNamespace(**item, model_dump=lambda mode="json": item)
+        with patch("builtins.input", return_value="y"):
+            count = execute_function_calls(
+                self.session, self.manager, SimpleNamespace(output=[sdk_item]),
+                0, 1, AgentTrace()
+            )
+        self.assertEqual(count, 1)
+        self.assertEqual(self.log.get_tool_execution("approved")["state"], "RESULT_RECORDED")
+        self.assertEqual(self.log.get_tool_approval("approved", 0), "CONSUMED")
+        self.assertEqual(len(self.calls), 1)
+
+        item2 = self.call(call_id="rejected")
+        sdk_item2 = SimpleNamespace(**item2, model_dump=lambda mode="json": item2)
+        with patch("builtins.input", return_value="n"):
+            count = execute_function_calls(
+                self.session, self.manager, SimpleNamespace(output=[sdk_item2]),
+                1, 2, AgentTrace()
+            )
+        self.assertEqual(count, 1)
+        self.assertEqual(self.log.get_tool_execution("rejected")["state"], "DENIED")
+        self.assertEqual(self.log.get_tool_approval("rejected", 0), "REJECTED")
+        self.assertEqual(len(self.calls), 1)
+
     def test_legacy_schema_migration_retains_executions(self):
         legacy_path = str(self.root / "old.sqlite")
         with sqlite3.connect(legacy_path) as c:
