@@ -26,7 +26,10 @@ class SandboxConfig:
     docker_bin: str = "docker"
 
     def __post_init__(self):
-        root = Path(self.workspace_root).resolve(strict=True)
+        try:
+            root = Path(self.workspace_root).resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError("Workspace does not exist or cannot be resolved") from exc
         if not root.is_dir():
             raise ValueError("Workspace must be a directory")
         if "," in str(root) or "\n" in str(root):
@@ -156,13 +159,15 @@ class SandboxRunner:
             aborted = proc is not None
             raise
         finally:
-            if aborted and proc is not None:
-                try:
-                    self._stop_cli(proc)
-                finally:
-                    self._remove_container(name)
-            if proc is not None and proc.stdout is not None:
-                proc.stdout.close()
+            try:
+                if aborted and proc is not None:
+                    try:
+                        self._stop_cli(proc)
+                    finally:
+                        self._remove_container(name)
+            finally:
+                if proc is not None and proc.stdout is not None:
+                    proc.stdout.close()
 
         return {
             "status": status,
