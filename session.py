@@ -72,6 +72,23 @@ class AgentSession:
             self.context_manager.invalidate()
             raise
 
+    def record_tool_denial(self, interaction: ToolInteraction,
+                           expected_started_count: int, *,
+                           retry: bool = False,
+                           rejected_approval: bool = False) -> None:
+        """Atomically persist denial and tool output before updating context."""
+        output_item = deepcopy(interaction.output)
+        self.execution_log.append_tool_denial(
+            interaction, expected_started_count, retry=retry,
+            rejected_approval=rejected_approval
+        )
+        self._history.append(output_item)
+        try:
+            self.context_manager.append(self._history, [output_item])
+        except Exception:
+            self.context_manager.invalidate()
+            raise
+
     def replace_history(self, new_history: list, new_step_ends: list[int]):
         deep_copy_new_history = deepcopy(new_history)
         deep_copy_new_step_ends = deepcopy(new_step_ends)

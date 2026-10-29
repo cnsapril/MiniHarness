@@ -47,15 +47,57 @@ class SQLiteExecutionLog:
                 tool_name TEXT NOT NULL,
                 input_json TEXT NOT NULL,
                 state TEXT NOT NULL CHECK(
-                    state IN ('RECORDED', 'STARTED', 'RETRY_READY', 'RESULT_RECORDED')
+                    state IN ('RECORDED', 'STARTED', 'RETRY_READY', 'RESULT_RECORDED', 'DENIED')
                 ),
                 started_count INTEGER NOT NULL DEFAULT 0 CHECK(started_count >= 0),
                 PRIMARY KEY (session_id, call_id)
             )
         """)
+        # SQLite cannot ALTER a CHECK constraint. Upgrade pre-PR#3 DBs in-place.
+        ddl = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='tool_executions'"
+        ).fetchone()[0]
+        if "'DENIED'" not in ddl:
+            with self.conn:
+                self.conn.execute("""
+                    CREATE TABLE tool_executions_upgrade (
+                        session_id TEXT NOT NULL,
+                        call_id TEXT NOT NULL,
+                        tool_name TEXT NOT NULL,
+                        input_json TEXT NOT NULL,
+                        state TEXT NOT NULL CHECK (
+                            state IN ('RECORDED', 'STARTED', 'RETRY_READY',
+                                      'RESULT_RECORDED', 'DENIED')
+                        ),
+                        started_count INTEGER NOT NULL DEFAULT 0 CHECK(started_count >= 0),
+                        PRIMARY KEY (session_id, call_id)
+                    )
+                """)
+                self.conn.execute("""
+                    INSERT INTO tool_executions_upgrade
+                    SELECT session_id, call_id, tool_name, input_json, state, started_count
+                    FROM tool_executions
+                """)
+                self.conn.execute("DROP TABLE tool_executions")
+                self.conn.execute(
+                    "ALTER TABLE tool_executions_upgrade RENAME TO tool_executions"
+                )
         self.conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_tool_executions_pending
             ON tool_executions(session_id, state)
+        """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS tool_approvals (
+                session_id TEXT NOT NULL,
+                call_id TEXT NOT NULL,
+                expected_started_count INTEGER NOT NULL CHECK(expected_started_count >= 0),
+                status TEXT NOT NULL CHECK(
+                    status IN ('PENDING', 'APPROVED', 'CONSUMED', 'REJECTED')
+                ),
+                PRIMARY KEY (session_id, call_id, expected_started_count),
+                FOREIGN KEY (session_id, call_id)
+                  REFERENCES tool_executions(session_id, call_id)
+            )
         """)
         self.conn.commit()
 
@@ -118,11 +160,70 @@ class SQLiteExecutionLog:
             for row in rows
         ]
 
-    def acquire_tool_execution(self, call_id: str, expected_started_count: int,
-                               *, retry: bool = False) -> int:
-        """Atomic optimistic-lock admission; returns the newly granted version."""
+    def get_tool_approval(self, call_id: str, expected_started_count: int) -> str | None:
+        row = self.conn.execute(
+            """SELECT status FROM tool_approvals
+               WHERE session_id = ? AND call_id = ? AND expected_started_count = ?""",
+            (self.session_id, call_id, expected_started_count)
+        ).fetchone()
+        return row[0] if row else None
+
+    def ensure_pending_approval(self, call_id: str, expected_started_count: int,
+                                *, retry: bool = False) -> str:
+        """Idempotently create an approval, only for a still-pending execution."""
         expected_state = "RETRY_READY" if retry else "RECORDED"
         with self.conn:
+            row = self.conn.execute(
+                """SELECT state, started_count FROM tool_executions
+                   WHERE session_id = ? AND call_id = ?""",
+                (self.session_id, call_id)
+            ).fetchone()
+            if row != (expected_state, expected_started_count):
+                raise ValueError(f"Cannot request approval for {call_id}")
+            self.conn.execute(
+                """INSERT OR IGNORE INTO tool_approvals(
+                      session_id, call_id, expected_started_count, status)
+                   VALUES (?, ?, ?, 'PENDING')""",
+                (self.session_id, call_id, expected_started_count)
+            )
+            return self.get_tool_approval(call_id, expected_started_count)
+
+    def approve_tool_execution(self, call_id: str, expected_started_count: int,
+                               *, retry: bool = False) -> None:
+        """Trusted user decision: persist APPROVED, not STARTED."""
+        expected_state = "RETRY_READY" if retry else "RECORDED"
+        with self.conn:
+            updated = self.conn.execute(
+                """UPDATE tool_approvals SET status = 'APPROVED'
+                   WHERE session_id = ? AND call_id = ?
+                     AND expected_started_count = ? AND status = 'PENDING'
+                     AND EXISTS (
+                         SELECT 1 FROM tool_executions
+                         WHERE session_id = tool_approvals.session_id
+                           AND call_id = tool_approvals.call_id
+                           AND state = ? AND started_count = ?
+                     )""",
+                (self.session_id, call_id, expected_started_count,
+                 expected_state, expected_started_count)
+            )
+            if updated.rowcount != 1:
+                raise ValueError(f"Approval no longer pending for {call_id}")
+
+    def acquire_tool_execution(self, call_id: str, expected_started_count: int,
+                               *, retry: bool = False,
+                               require_approval: bool = False) -> int:
+        """Consume Approval (if required) and grant STARTED with the same CAS transaction."""
+        expected_state = "RETRY_READY" if retry else "RECORDED"
+        with self.conn:
+            if require_approval:
+                updated = self.conn.execute(
+                    """UPDATE tool_approvals SET status = 'CONSUMED'
+                       WHERE session_id = ? AND call_id = ?
+                         AND expected_started_count = ? AND status = 'APPROVED'""",
+                    (self.session_id, call_id, expected_started_count)
+                )
+                if updated.rowcount != 1:
+                    raise ValueError(f"Approval not granted for {call_id}")
             updated = self.conn.execute(
                 """UPDATE tool_executions
                    SET state = 'STARTED', started_count = started_count + 1
@@ -146,6 +247,49 @@ class SQLiteExecutionLog:
             if updated.rowcount != 1:
                 raise ValueError(f"Retry authorization rejected for {call_id}")
 
+    def append_tool_denial(self, interaction: ToolInteraction,
+                           expected_started_count: int, *,
+                           retry: bool = False, rejected_approval: bool = False) -> None:
+        """Atomically deny an unstarted attempt, including the final output and ledger.
+
+        A retry DENIED means retry denied, NOT proof earlier external effects
+        did not occur; started_count is intentionally preserved.
+        """
+        expected_state = "RETRY_READY" if retry else "RECORDED"
+        payload = interaction.to_payload()
+        with self.conn:
+            if rejected_approval:
+                updated = self.conn.execute(
+                    """UPDATE tool_approvals SET status = 'REJECTED'
+                       WHERE session_id = ? AND call_id = ?
+                         AND expected_started_count = ? AND status = 'PENDING'""",
+                    (self.session_id, interaction.call_id, expected_started_count)
+                )
+                if updated.rowcount != 1:
+                    raise ValueError(f"Approval cannot be rejected: {interaction.call_id}")
+            updated = self.conn.execute(
+                """UPDATE tool_executions SET state = 'DENIED'
+                   WHERE session_id = ? AND call_id = ?
+                     AND state = ? AND started_count = ?""",
+                (self.session_id, interaction.call_id, expected_state, expected_started_count)
+            )
+            if updated.rowcount != 1:
+                raise ValueError(f"Denial rejected by execution CAS: {interaction.call_id}")
+            self._append_output_and_ledger(interaction, payload)
+
+    def _append_output_and_ledger(self, interaction: ToolInteraction, payload: dict) -> None:
+        """Caller must hold the enclosing transaction."""
+        cursor = self.conn.execute(
+            "INSERT INTO events(session_id, kind, payload) VALUES (?, ?, ?)",
+            (self.session_id, "history_items",
+             json.dumps({"items": [payload["output"]]}, ensure_ascii=False))
+        )
+        self.conn.execute(
+            "INSERT INTO tool_interactions(session_id, call_id, event_id, payload) VALUES (?, ?, ?, ?)",
+            (self.session_id, interaction.call_id, cursor.lastrowid,
+             json.dumps(payload, ensure_ascii=False))
+        )
+
     def append_tool_interaction(self, interaction: ToolInteraction,
                                 expected_started_count: int) -> None:
         """Atomically commit state, context-result event and pair ledger.
@@ -164,16 +308,7 @@ class SQLiteExecutionLog:
                 raise ValueError(
                     f"Stale or invalid tool result commit: {interaction.call_id}"
                 )
-            cursor = self.conn.execute(
-                "INSERT INTO events(session_id, kind, payload) VALUES (?, ?, ?)",
-                (self.session_id, "history_items",
-                 json.dumps({"items": [payload["output"]]}, ensure_ascii=False))
-            )
-            self.conn.execute(
-                "INSERT INTO tool_interactions(session_id, call_id, event_id, payload) VALUES (?, ?, ?, ?)",
-                (self.session_id, interaction.call_id, cursor.lastrowid,
-                 json.dumps(payload, ensure_ascii=False))
-            )
+            self._append_output_and_ledger(interaction, payload)
 
     def get_tool_interaction(self, call_id: str) -> ToolInteraction | None:
         row = self.conn.execute(
