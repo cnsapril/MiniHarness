@@ -11,7 +11,7 @@ from context_manager import ContextBudget, ContextManager
 from permission import PermissionPolicy, PermissionRequirement
 from session import AgentSession
 from sqlite_execution_log import SQLiteExecutionLog
-from tool_execution import (ToolDispatchStatus, RecoveryInspector,
+from tool_execution import (ApprovalDecision, ToolDispatchStatus, RecoveryInspector,
                             ToolExecutionManager, ToolPhase, UnsafeToolRetryError)
 from tool_registry import (ToolRegistry, ToolSafety, ToolSpec, write_file,
                            write_file_permission_check, workspace_path_permission_check)
@@ -64,6 +64,63 @@ class PermissionApprovalTest(unittest.TestCase):
             )
         else:
             self.session.record_tool_interaction(outcome.interaction, outcome.started_count)
+
+    def test_manager_owns_approval_workflow(self):
+        item = self.call()
+        seen = []
+
+        def authorize(pending, recorded):
+            seen.append((pending.call_id, pending.expected_started_count, recorded))
+            self.assertEqual(self.log.get_tool_execution("call-1")["state"], "RECORDED")
+            self.assertEqual(self.log.get_tool_approval("call-1", 0), "PENDING")
+            return ApprovalDecision.APPROVE
+
+        outcome = self.manager.run_with_approval(item, authorize)
+        self.assertEqual(outcome.status, ToolDispatchStatus.COMPLETED)
+        self.assertEqual(seen[0][0:2], ("call-1", 0))
+        self.assertEqual(seen[0][2], item)
+        self.assertEqual(self.log.get_tool_approval("call-1", 0), "CONSUMED")
+        self.assertEqual(self.log.get_tool_execution("call-1")["state"], "STARTED")
+        self.assertEqual(len(self.calls), 1)
+        self.commit(outcome)
+
+    def test_manager_owns_rejection_workflow(self):
+        item = self.call()
+        seen = []
+
+        def reject(pending, recorded):
+            seen.append((pending, recorded))
+            return ApprovalDecision.REJECT
+
+        outcome = self.manager.run_with_approval(item, reject)
+        self.assertEqual(outcome.status, ToolDispatchStatus.DENIED)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(len(self.calls), 0)
+        self.assertEqual(self.log.get_tool_approval("call-1", 0), "PENDING")
+        self.commit(outcome)
+        self.assertEqual(self.log.get_tool_approval("call-1", 0), "REJECTED")
+        self.assertEqual(self.log.get_tool_execution("call-1")["state"], "DENIED")
+
+    def test_manager_skips_approval_callback_when_policy_decides(self):
+        def fail(*args):
+            raise AssertionError("Approval callback must not run")
+        allowed = self.call(tool="read", call_id="read-1")
+        executed = self.manager.run_with_approval(allowed, fail)
+        self.assertEqual(executed.status, ToolDispatchStatus.COMPLETED)
+        self.commit(executed)
+        denied = self.call(tool="blocked", call_id="blocked-1")
+        declined = self.manager.run_with_approval(denied, fail)
+        self.assertEqual(declined.status, ToolDispatchStatus.DENIED)
+        self.commit(declined)
+        self.assertEqual(self.log.get_tool_execution("blocked-1")["state"], "DENIED")
+
+    def test_manager_invalid_ui_decision_stays_pending(self):
+        item = self.call()
+        with self.assertRaises(ValueError):
+            self.manager.run_with_approval(item, lambda pending, recorded: "approve")
+        self.assertEqual(self.log.get_tool_approval("call-1", 0), "PENDING")
+        self.assertEqual(self.log.get_tool_execution("call-1")["state"], "RECORDED")
+        self.assertEqual(self.calls, [])
 
     def test_pending_is_durable_and_does_not_run_handler(self):
         item = self.call()

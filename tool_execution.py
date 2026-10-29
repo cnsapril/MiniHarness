@@ -7,7 +7,7 @@ conversation; Tool Interaction Ledger retains completed input/output pairs.
 import json
 from dataclasses import dataclass
 from enum import Enum
-from typing import ClassVar
+from typing import Callable, ClassVar
 
 from context_manager import ContextHelper
 from permission import PermissionPolicy, PermissionRequirement
@@ -27,6 +27,11 @@ class ToolDispatchStatus(str, Enum):
     COMPLETED = "COMPLETED"
     APPROVAL_PENDING = "APPROVAL_PENDING"
     DENIED = "DENIED"
+
+
+class ApprovalDecision(str, Enum):
+    APPROVE = "APPROVE"
+    REJECT = "REJECT"
 
 
 class UnsafeToolRetryError(RuntimeError):
@@ -270,6 +275,41 @@ class ToolExecutionManager:
             return self._prepare_result(input_item, {"error": repr(exc)},
                                         False, repr(exc), granted_version)
         return self._prepare_result(input_item, result, True, None, granted_version)
+
+    def run_with_approval(
+        self, tool_call,
+        approval_provider: Callable[[ToolApprovalPending, dict], ApprovalDecision],
+        *, retry: bool = False,
+    ) -> ToolExecutionOutcome | ToolDenialOutcome:
+        """Run the permission+approval workflow through a trusted UI port.
+
+        Only presentation and the human decision live outside this manager.
+        Persisting the final response still belongs to AgentSession.
+        """
+        outcome = self.execute(tool_call, retry=retry)
+        if outcome.status != ToolDispatchStatus.APPROVAL_PENDING:
+            return outcome
+
+        # Give the UI the immutable recorded request, never a model-crafted
+        # approval flag. The callback is provided by trusted host code.
+        input_item, _ = self._recorded(tool_call)
+        decision = approval_provider(outcome, input_item)
+        if decision == ApprovalDecision.REJECT:
+            return self.reject(
+                tool_call, expected_started_count=outcome.expected_started_count,
+                retry=outcome.retry,
+            )
+        if decision != ApprovalDecision.APPROVE:
+            raise ValueError(f"Invalid approval decision: {decision!r}")
+
+        self.approve(
+            outcome.call_id, expected_started_count=outcome.expected_started_count,
+            retry=outcome.retry,
+        )
+        resumed = self.execute(tool_call, retry=outcome.retry)
+        if resumed.status == ToolDispatchStatus.APPROVAL_PENDING:
+            raise RuntimeError("Approved invocation unexpectedly remains pending")
+        return resumed
 
     @staticmethod
     def _prepare_result(input_item, result, returned_normally,

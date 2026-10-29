@@ -14,7 +14,7 @@ from logging_config import setup_logging
 from session import AgentSession
 from sqlite_execution_log import SQLiteExecutionLog
 from trace_model import AgentTrace, LLMCallTrace, ToolCallTrace, AgentStatus
-from tool_execution import (RecoveryInspector, ToolDispatchStatus,
+from tool_execution import (ApprovalDecision, RecoveryInspector, ToolDispatchStatus,
                             ToolExecutionManager, UnknownToolOutcomeError)
 from tool_registry import default_tool_registry
 
@@ -109,6 +109,15 @@ def record_tool_call_trace(trace: AgentTrace, start: float, current_step: int, c
     ))
 
 
+def cli_approval_provider(pending, recorded_input: dict) -> ApprovalDecision:
+    """Only the trusted CLI gathers user consent; it does not mutate execution state."""
+    print(f"\nApproval requested for {recorded_input['name']} "
+          f"(call_id={pending.call_id}, attempt={pending.expected_started_count + 1})")
+    print(f"Arguments: {recorded_input['arguments']}")
+    approved = input("Approve this exact tool call? [y/N]: ").strip().lower() in ("y", "yes")
+    return ApprovalDecision.APPROVE if approved else ApprovalDecision.REJECT
+
+
 def execute_function_calls(session: AgentSession, executor: ToolExecutionManager, response,
                            total_tool_calls: int, current_step: int, trace: AgentTrace) -> int:
     tool_call_count = 0
@@ -125,27 +134,7 @@ def execute_function_calls(session: AgentSession, executor: ToolExecutionManager
         call_id = item.call_id
         logger.info("[Tool Call] %s: %s", tool_name, item.arguments)
         try:
-            outcome = executor.execute(item)
-            if outcome.status == ToolDispatchStatus.APPROVAL_PENDING:
-                # Pending approval is normal workflow state, not an exception.
-                # Only trusted CLI input can approve; never accept LLM-supplied approval.
-                print(f"\nApproval requested for {tool_name} (call_id={call_id}, "
-                      f"attempt={outcome.expected_started_count + 1})")
-                print(f"Arguments: {item.arguments}")
-                approved = input("Approve this exact tool call? [y/N]: ").strip().lower() in ("y", "yes")
-                if approved:
-                    executor.approve(
-                        outcome.call_id, expected_started_count=outcome.expected_started_count,
-                        retry=outcome.retry,
-                    )
-                    outcome = executor.execute(item, retry=outcome.retry)
-                    if outcome.status == ToolDispatchStatus.APPROVAL_PENDING:
-                        raise RuntimeError("Approved tool call unexpectedly remains pending")
-                else:
-                    outcome = executor.reject(
-                        item, expected_started_count=outcome.expected_started_count,
-                        retry=outcome.retry,
-                    )
+            outcome = executor.run_with_approval(item, cli_approval_provider)
 
             if outcome.status == ToolDispatchStatus.DENIED:
                 session.record_tool_denial(
