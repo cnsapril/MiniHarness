@@ -303,35 +303,6 @@ class PermissionApprovalTest(unittest.TestCase):
         self.assertEqual(self.log.get_tool_approval("rejected", 0), "REJECTED")
         self.assertEqual(len(self.calls), 1)
 
-    def test_legacy_schema_migration_retains_executions(self):
-        legacy_path = str(self.root / "old.sqlite")
-        with sqlite3.connect(legacy_path) as c:
-            c.execute("""
-                CREATE TABLE tool_executions (
-                    session_id TEXT NOT NULL, call_id TEXT NOT NULL,
-                    tool_name TEXT NOT NULL, input_json TEXT NOT NULL,
-                    state TEXT NOT NULL CHECK (
-                        state IN ('RECORDED', 'STARTED', 'RETRY_READY', 'RESULT_RECORDED')
-                    ),
-                    started_count INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY(session_id, call_id)
-                )
-            """)
-            c.execute(
-                """INSERT INTO tool_executions VALUES (?, ?, ?, ?, ?, ?)""",
-                ("session-1", "old", "read", json.dumps({
-                    "type": "function_call", "call_id": "old", "name": "read",
-                    "arguments": "{}"}), "STARTED", 3)
-            )
-        log = SQLiteExecutionLog(legacy_path, "session-1")
-        try:
-            self.assertEqual(log.get_tool_execution("old")["started_count"], 3)
-            self.assertEqual(log.get_tool_execution("old")["state"], "STARTED")
-            c = log.conn.execute("SELECT sql FROM sqlite_master WHERE name = 'tool_executions'")
-            self.assertIn("'DENIED'", c.fetchone()[0])
-            self.assertEqual(log.list_tool_executions()[0]["call_id"], "old")
-        finally:
-            log.close()
 
 
 if __name__ == "__main__":

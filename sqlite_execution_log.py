@@ -53,35 +53,6 @@ class SQLiteExecutionLog:
                 PRIMARY KEY (session_id, call_id)
             )
         """)
-        # SQLite cannot ALTER a CHECK constraint. Upgrade pre-PR#3 DBs in-place.
-        ddl = self.conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='tool_executions'"
-        ).fetchone()[0]
-        if "'DENIED'" not in ddl:
-            with self.conn:
-                self.conn.execute("""
-                    CREATE TABLE tool_executions_upgrade (
-                        session_id TEXT NOT NULL,
-                        call_id TEXT NOT NULL,
-                        tool_name TEXT NOT NULL,
-                        input_json TEXT NOT NULL,
-                        state TEXT NOT NULL CHECK (
-                            state IN ('RECORDED', 'STARTED', 'RETRY_READY',
-                                      'RESULT_RECORDED', 'DENIED')
-                        ),
-                        started_count INTEGER NOT NULL DEFAULT 0 CHECK(started_count >= 0),
-                        PRIMARY KEY (session_id, call_id)
-                    )
-                """)
-                self.conn.execute("""
-                    INSERT INTO tool_executions_upgrade
-                    SELECT session_id, call_id, tool_name, input_json, state, started_count
-                    FROM tool_executions
-                """)
-                self.conn.execute("DROP TABLE tool_executions")
-                self.conn.execute(
-                    "ALTER TABLE tool_executions_upgrade RENAME TO tool_executions"
-                )
         self.conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_tool_executions_pending
             ON tool_executions(session_id, state)
