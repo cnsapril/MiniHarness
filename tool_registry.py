@@ -8,6 +8,7 @@ from typing import Callable
 from uuid import uuid4
 
 from permission import PermissionRequirement
+from sandbox_runner import SandboxConfig, SandboxRunner
 
 
 class ToolSafety(str, Enum):
@@ -146,6 +147,7 @@ def write_file(path: str, content: str) -> str:
 
 
 def default_tool_registry() -> ToolRegistry:
+    sandbox = SandboxRunner(SandboxConfig(PROJECT_ROOT))
     return ToolRegistry([
         ToolSpec(
             name="list_files",
@@ -163,6 +165,22 @@ def default_tool_registry() -> ToolRegistry:
                     }
                 },
                 "required": ["path"],
+                "additionalProperties": False,
+            },
+        ),
+        ToolSpec(
+            name="run_tests",
+            handler=sandbox.run_tests,
+            safety=ToolSafety.SIDE_EFFECTING,
+            permission=PermissionRequirement.ASK,
+            description=(
+                "Run the MiniHarness unittest suite in an isolated, network-disabled "
+                "Docker container with a read-only workspace and resource limits."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {},
+                "required": [],
                 "additionalProperties": False,
             },
         ),

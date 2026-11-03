@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import TestCase
 from unittest.mock import Mock
 from uuid import uuid4
@@ -8,10 +10,19 @@ from context_manager import ContextBudget, ContextManager, ContextHelper
 from session import AgentSession
 from sqlite_execution_log import SQLiteExecutionLog
 
-DB_PATH = "tests/test_sqlite_execution_log.db"
-
-
 class CompactorTest(TestCase):
+    def setUp(self):
+        # Tests must not write into the repository: the Docker sandbox mounts
+        # /workspace read-only and only /tmp is writable.
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.db_path = str(Path(temp.name) / "compaction.sqlite")
+
+    def new_execution_log(self):
+        log = SQLiteExecutionLog(self.db_path, str(uuid4()))
+        self.addCleanup(log.close)
+        return log
+
 
     def test_compaction_llm_failure(self):
         # Arrange: 准备Session
@@ -20,7 +31,7 @@ class CompactorTest(TestCase):
             reserved_output_tokens=2048
         )
         manager = ContextManager(budget, 0.8)
-        execution_log = SQLiteExecutionLog(DB_PATH, str(uuid4()))
+        execution_log = self.new_execution_log()
         session = AgentSession(manager, execution_log)
         session.append([
             {"role": "user", "content": "List project files"}
@@ -69,7 +80,7 @@ class CompactorTest(TestCase):
             reserved_output_tokens=2048
         )
         manager = ContextManager(budget, 0.8)
-        execution_log = SQLiteExecutionLog(DB_PATH, str(uuid4()))
+        execution_log = self.new_execution_log()
         session = AgentSession(manager, execution_log)
         session.append([
             {"role": "user", "content": "List project files"}
@@ -131,7 +142,7 @@ class CompactorTest(TestCase):
             reserved_output_tokens=2048
         )
         manager = ContextManager(budget, 0.8)
-        execution_log = SQLiteExecutionLog(DB_PATH, str(uuid4()))
+        execution_log = self.new_execution_log()
         session = AgentSession(manager, execution_log)
         session.append([
             {"role": "user", "content": "List project files"}
