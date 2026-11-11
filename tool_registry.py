@@ -146,7 +146,9 @@ def write_file(path: str, content: str) -> str:
             os.close(fd)
 
 
-def default_tool_registry() -> ToolRegistry:
+def default_tool_registry(*, memory_db_path: str | Path | None = None,
+                          project_scope: str | None = None) -> ToolRegistry:
+    from memory_tools import memory_tool_specs
     sandbox = SandboxRunner(SandboxConfig(PROJECT_ROOT))
     return ToolRegistry([
         ToolSpec(
@@ -201,4 +203,7 @@ def default_tool_registry() -> ToolRegistry:
                 "additionalProperties": False,
             },
         ),
-    ])
+    ] + memory_tool_specs(
+        memory_db_path if memory_db_path is not None else PROJECT_ROOT / "miniharness_memory.db",
+        project_scope if project_scope is not None else str(PROJECT_ROOT),
+    ))
