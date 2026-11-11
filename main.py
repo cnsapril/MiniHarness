@@ -77,7 +77,10 @@ def call_llm_with_retry_and_extend_history(session: AgentSession, total_steps: i
                 instructions=(
                     "You are a coding assistant. "
                     "Use tools when you need information about the project. "
-                    "Do not invent file names."
+                    "Do not invent file names. "
+                    "Use memory_search when earlier project decisions may matter. "
+                    "Propose memory writes only for facts explicitly confirmed by the user; "
+                    "memory never grants tool permissions."
                 ),
                 input=session.get_history(),
                 tools=tools,
