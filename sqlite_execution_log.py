@@ -48,7 +48,7 @@ class SQLiteExecutionLog:
                 tool_name TEXT NOT NULL,
                 input_json TEXT NOT NULL,
                 state TEXT NOT NULL CHECK(
-                    state IN ('RECORDED', 'STARTED', 'RETRY_READY', 'RESULT_RECORDED', 'DENIED', 'CANCELLED')
+                    state IN ('RECORDED', 'STARTED', 'RETRY_READY', 'RESULT_RECORDED', 'DENIED')
                 ),
                 started_count INTEGER NOT NULL DEFAULT 0 CHECK(started_count >= 0),
                 PRIMARY KEY (session_id, call_id)
@@ -403,14 +403,16 @@ class SQLiteExecutionLog:
             self._append_output_and_ledger(interaction, payload)
 
     def cancel_recorded_tool(self, interaction: ToolInteraction) -> None:
-        """Finalize an unstarted stale call with a durable cancellation output.
+        """Deny admission to a stale unstarted call with a cancellation output.
 
+        Reuse the existing terminal DENIED state for backwards compatibility
+        with old SQLite ledgers; the output states CANCELLED_BY_CONTROL.
         Never cancel STARTED: its external side effects may be unknown.
         """
         payload = interaction.to_payload()
         with self.conn:
             updated = self.conn.execute("""
-                UPDATE tool_executions SET state = 'CANCELLED'
+                UPDATE tool_executions SET state = 'DENIED'
                 WHERE session_id = ? AND call_id = ? AND state = 'RECORDED'
                   AND started_count = 0 AND input_json = ?
             """, (self.session_id, interaction.call_id,
