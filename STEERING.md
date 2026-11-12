@@ -1,7 +1,7 @@
 # Mid-turn steering MVP
 
 MiniHarness is still a small synchronous Python agent, but this MVP adds a
-**durable Turn control queue** and an optional **LLM text event stream**.
+**durable Turn control queue**. Model responses remain non-streaming.
 
 It deliberately does **not** implement Codex's full app-server protocol,
 a terminal TUI, automatic rollback, or semantic tool-call classification.
@@ -11,7 +11,7 @@ a terminal TUI, automatic rollback, or semantic tool-call classification.
 Terminal A:
 
 ```bash
-python main.py new "Refactor PaymentService" --stream
+python main.py new "Refactor PaymentService"
 ```
 
 The agent prints a `Session ID` when the turn starts. While it is running,
@@ -41,8 +41,8 @@ control. This MVP does not implement asynchronous prompt cancellation.
   invocation (one turn per session in v1); `turn_controls` persists queued
   STEER / INTERRUPT requests.
 - **Steering**: safe-boundary consumption appends a durable user message to
-  the same session history. A model response still streaming when new input
-  arrives is discarded rather than committed as if it were fresh.
+  the same session history. A stale model response returned after a new input
+  arrives is discarded before being committed.
 - **Tool calls**: if a control arrives between Tool Calls, remaining RECORDED
   calls are closed with `CANCELLED_BY_CONTROL` function outputs. Existing
   terminal ledger state `DENIED` is reused to avoid breaking old databases;
@@ -53,10 +53,9 @@ control. This MVP does not implement asynchronous prompt cancellation.
   retroactively cancelled and may have side effects.
 - **Interrupt**: separate from Steering, persisted and finalized as
   `INTERRUPTED`. Any unprocessed steering remains marked `UNHANDLED`.
-- **Streaming**: `--stream` consumes Responses API events and emits
-  `text_delta` events through a tiny `TurnEventSink`. Only complete model
-  responses enter the durable history. Intermediate deltas can be displayed
-  before an interruption but are not committed when the response is discarded.
+- **Turn events**: lightweight lifecycle events (such as `turn_started`,
+  `steering_applied`, `tools_cancelled`) remain for CLI observability.
+  No token-level output streaming is implemented.
 - **Recovery**: serialized history, tool outputs, and control events remain
   inspectable. This PR does not auto-resume or retry tools after a crash.
 
@@ -65,14 +64,13 @@ control. This MVP does not implement asynchronous prompt cancellation.
 - Turn status is recorded under the session ID, with one turn per invocation.
   This is not multi-turn conversational session management.
 - This uses two CLI processes. It does not support typing steering into the
-  same terminal while streamed output is running.
-- **No immediate preemption** of a blocking model call (without streaming),
-  tool handler, or approval prompt. Steering is only guaranteed to take effect
-  at a subsequent safe boundary.
+  same terminal while an agent turn is running.
+- **No immediate preemption** of a blocking model call, tool handler,
+  or approval prompt. Steering is only guaranteed to take effect at a
+  subsequent safe boundary. When a blocking LLM call returns, its stale
+  response is discarded if a control arrived while it was executing.
 - The database has no worker heartbeat or lease; an unclean process death may
   leave a stale RUNNING turn until it is inspected/reconciled.
-- Optional streaming requires the configured model server to support the
-  Responses API streaming events.
 - Side-effecting operations that end with an unknown result keep their
   STARTED state, and require manual reconciliation; they are not blindly
   retried or rolled back.
@@ -87,5 +85,5 @@ python -m unittest discover -s tests -p 'test_*.py'
 ```
 
 The tests cover durable control replay, steering vs interrupt priority,
-no stale tool execution, approval-control race fencing, streaming stale-output
-discard, and the completion/arrival boundary.
+no stale tool execution, approval-control race fencing, blocking LLM
+stale-response discard, and the completion/arrival boundary.
