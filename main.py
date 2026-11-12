@@ -155,24 +155,43 @@ def cli_approval_provider(pending, recorded_input: dict) -> ApprovalDecision:
     return ApprovalDecision.APPROVE if approved else ApprovalDecision.REJECT
 
 
-def execute_function_calls(session: AgentSession, executor: ToolExecutionManager, response,
-                           total_tool_calls: int, current_step: int, trace: AgentTrace) -> int:
+def execute_function_calls(
+        session: AgentSession, executor: ToolExecutionManager, response,
+        total_tool_calls: int, current_step: int, trace: AgentTrace, *,
+        controller: TurnController | None = None,
+        event_sink: TurnEventSink | None = None) -> int:
+    """Dispatch only while no newer control is queued.
+
+    If the user steers between tools, terminate all remaining RECORDED calls
+    with a durable cancellation output. Do not semantically reclassify tools.
+    """
     tool_call_count = 0
-    for item in response.output:
+    output = list(response.output)
+    for index, item in enumerate(output):
         if item.type != "function_call":
             logger.info(item)
             continue
 
+        if controller is not None and controller.has_pending():
+            cancelled = controller.cancel_unstarted(
+                output[index:], "A new user control arrived before tool admission"
+            )
+            emit(event_sink, "tools_cancelled", count=cancelled)
+            return tool_call_count + cancelled
+
         if total_tool_calls + tool_call_count >= MAX_TOOL_CALLS:
+            # The remaining registered calls still need a terminal ledger record.
+            if controller is not None:
+                controller.cancel_unstarted(output[index:], "Tool call limit reached")
             raise LimitExceededError(f"Agent tool calls have exceeded limit {MAX_TOOL_CALLS}")
 
         start = perf_counter()
         tool_name = item.name
         call_id = item.call_id
         logger.info("[Tool Call] %s: %s", tool_name, item.arguments)
+        emit(event_sink, "tool_started", name=tool_name, call_id=call_id)
         try:
             outcome = executor.run_with_approval(item, cli_approval_provider)
-
             if outcome.status == ToolDispatchStatus.DENIED:
                 session.record_tool_denial(
                     outcome.interaction, outcome.expected_started_count,
@@ -183,27 +202,50 @@ def execute_function_calls(session: AgentSession, executor: ToolExecutionManager
                     f"PERMISSION_DENIED: {outcome.reason}",
                 )
                 logger.info("[Tool Denied] %s", outcome.reason)
+                emit(event_sink, "tool_denied", name=tool_name, call_id=call_id)
             elif outcome.status == ToolDispatchStatus.COMPLETED:
-                # State CAS + output event + ledger commit atomically via Session.
                 session.record_tool_interaction(outcome.interaction, outcome.started_count)
                 record_tool_call_trace(
-                    trace, start, current_step, call_id,
-                    tool_name, outcome.handler_returned_normally, outcome.error,
+                    trace, start, current_step, call_id, tool_name,
+                    outcome.handler_returned_normally, outcome.error,
                 )
                 logger.info("[Tool Result] %s", outcome.result)
+                emit(event_sink, "tool_completed", name=tool_name, call_id=call_id)
             else:
                 raise RuntimeError(f"Unexpected Tool Dispatch Status: {outcome.status}")
+        except UnsafeToolRetryError:
+            # A control may arrive while a user is responding to an approval
+            # prompt. SQLite blocks STARTED admission atomically in that case.
+            if controller is not None and controller.has_pending():
+                cancelled = controller.cancel_unstarted(
+                    output[index:], "User control arrived during tool admission"
+                )
+                emit(event_sink, "tools_cancelled", count=cancelled)
+                return tool_call_count + cancelled
+            raise
         except UnknownToolOutcomeError as exc:
-            # Do not turn an uncertain external outcome into a normal tool error.
             record_tool_call_trace(trace, start, current_step, call_id, tool_name, False, repr(exc))
             raise
         tool_call_count += 1
-
     return tool_call_count
 
 
-# Main Agent Loop
-def agent_loop(user_prompt: str) -> str:
+def _consume_controls(
+        controller: TurnController, trace: AgentTrace,
+        event_sink: TurnEventSink | None) -> ControlAction:
+    action = controller.consume_pending()
+    if action == ControlAction.INTERRUPTED:
+        trace.status = AgentStatus.INTERRUPTED
+        emit(event_sink, "turn_interrupted")
+    elif action == ControlAction.STEERED:
+        emit(event_sink, "steering_applied")
+    return action
+
+
+# Main Agent Loop: one durable Turn per invocation in this MVP.
+def agent_loop(user_prompt: str, *, stream: bool = False,
+               event_sink: TurnEventSink | None = None,
+               db_path: str | None = None) -> str:
     context_budget = ContextBudget(
         max_context_tokens=MAX_CONTEXT_TOKEN_LEN,
         reserved_output_tokens=RESERVED_OUTPUT_TOKEN_LEN
@@ -212,41 +254,64 @@ def agent_loop(user_prompt: str) -> str:
         context_budget=context_budget,
         compaction_ratio=COMPACTION_RATIO
     )
-    execution_log = SQLiteExecutionLog(DB_PATH, str(uuid4()))
+    execution_log = SQLiteExecutionLog(db_path or DB_PATH, str(uuid4()))
     session = AgentSession(context_manager, execution_log)
+    controller = TurnController(session)
     executor = ToolExecutionManager(execution_log, registry)
     logger.info("[Session ID] %s", execution_log.get_session_id())
     trace = AgentTrace()
     total_steps = 0
     total_tool_calls = 0
     try:
+        execution_log.start_turn()
+        emit(event_sink, "turn_started", session_id=execution_log.get_session_id())
         session.append([{"role": "user", "content": user_prompt}])
         while True:
-            # 处理上下文压缩
+            # Controls are also checked at the top of each step; new controls
+            # during a model request invalidate the still-uncommitted response.
+            action = _consume_controls(controller, trace, event_sink)
+            if action == ControlAction.INTERRUPTED:
+                return "Turn interrupted before further tool execution."
+
             if session.should_compact():
                 compact_session(session, client)
-            # LLM调用
-            response = call_llm_with_retry_and_extend_history(session, total_steps, trace)
-            # AgentSession.append() atomically recorded all function calls as RECORDED.
+            response = call_llm_with_retry_and_extend_history(
+                session, total_steps, trace,
+                controller=controller, stream=stream, event_sink=event_sink,
+            )
+            if response is None:
+                continue  # A queued control invalidated this model response.
+
             total_steps += 1
-            # Function Call处理
             tool_call_count = execute_function_calls(
-                session, executor, response, total_tool_calls, total_steps, trace
+                session, executor, response, total_tool_calls, total_steps, trace,
+                controller=controller, event_sink=event_sink,
             )
             total_tool_calls += tool_call_count
-            # 记录Context Safe Boundary
             session.mark_step_complete()
-            # 判断正常执行终止
+            action = _consume_controls(controller, trace, event_sink)
+            if action == ControlAction.INTERRUPTED:
+                return "Turn interrupted; completed tool effects remain unchanged."
+            if action == ControlAction.STEERED:
+                continue  # Next LLM sampling sees the new user message.
+
             if tool_call_count == 0:
-                trace.status = AgentStatus.COMPLETED
-                return response.output_text
+                # Transactional completion: a concurrent control either wins
+                # and is processed, or is rejected because the turn is closed.
+                if execution_log.finish_turn("COMPLETED", require_no_pending=True):
+                    trace.status = AgentStatus.COMPLETED
+                    emit(event_sink, "turn_completed")
+                    return response.output_text
+                continue
     except LimitExceededError as e:
         trace.status = AgentStatus.LIMIT_EXCEEDED
         trace.error = repr(e)
+        execution_log.finish_turn("FAILED")
         raise
     except Exception as e:
         trace.status = AgentStatus.FAILED
         trace.error = repr(e)
+        execution_log.finish_turn("FAILED")
         raise
     finally:
         trace.ended_at = datetime.now(timezone.utc)
