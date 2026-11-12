@@ -8,6 +8,7 @@ class AgentStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     LIMIT_EXCEEDED = "limit_exceeded"
+    INTERRUPTED = "interrupted"
 
 
 @dataclass
