@@ -238,6 +238,10 @@ def _consume_controls(
         trace.status = AgentStatus.INTERRUPTED
         emit(event_sink, "turn_interrupted")
     elif action == ControlAction.STEERED:
+        # A steered input is a durable, complete history boundary even though
+        # the next model sample has not happened yet. Compaction must not
+        # mistake that appended user message for an unfinished tool response.
+        controller.session.mark_step_complete()
         emit(event_sink, "steering_applied")
     return action
 
