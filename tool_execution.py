@@ -21,7 +21,6 @@ class ToolPhase(str, Enum):
     RETRY_READY = "RETRY_READY"
     RESULT_RECORDED = "RESULT_RECORDED"
     DENIED = "DENIED"
-    CANCELLED = "CANCELLED"
 
 
 class ToolDispatchStatus(str, Enum):
@@ -60,7 +59,7 @@ class RecoveryReport:
     @property
     def unresolved(self) -> tuple[ToolCallInspection, ...]:
         return tuple(c for c in self.calls
-                     if c.phase not in (ToolPhase.RESULT_RECORDED, ToolPhase.DENIED, ToolPhase.CANCELLED))
+                     if c.phase not in (ToolPhase.RESULT_RECORDED, ToolPhase.DENIED))
 
     def get(self, call_id: str) -> ToolCallInspection | None:
         return next((c for c in self.calls if c.call_id == call_id), None)
