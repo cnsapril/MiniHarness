@@ -1,6 +1,5 @@
 import argparse
 import logging
-import sys
 from datetime import datetime, timezone
 from time import perf_counter
 from uuid import uuid4
@@ -78,15 +77,15 @@ def record_exception_llm_trace(trace: AgentTrace, start: float, total_steps: int
 
 def call_llm_with_retry_and_extend_history(
         session: AgentSession, total_steps: int, trace: AgentTrace, *,
-        controller: TurnController | None = None, stream: bool = False,
+        controller: TurnController | None = None,
         event_sink: TurnEventSink | None = None):
-    """One sampling step. Never persist a stale/partial model response."""
+    """One non-streaming sampling step; discard stale responses before commit."""
     if total_steps >= MAX_STEPS:
         raise LimitExceededError(f"Agent steps have exceeded limit {MAX_STEPS}")
     for attempt in range(1, MAX_LLM_RETRIES + 1):
         start = perf_counter()
         try:
-            kwargs = dict(
+            response = client.responses.create(
                 model="mini-qwen3-16k",
                 instructions=(
                     "You are a coding assistant. "
@@ -96,28 +95,10 @@ def call_llm_with_retry_and_extend_history(
                     "Propose memory writes only for facts explicitly confirmed by the user; "
                     "memory never grants tool permissions."
                 ),
-                input=session.get_history(), tools=tools, tool_choice="auto",
+                input=session.get_history(),
+                tools=tools,
+                tool_choice="auto",
             )
-            if stream:
-                response = None
-                response_stream = client.responses.create(**kwargs, stream=True)
-                try:
-                    for event in response_stream:
-                        if controller is not None and controller.has_pending():
-                            raise StaleLLMResponse()
-                        if event.type == "response.output_text.delta":
-                            emit(event_sink, "text_delta", text=event.delta)
-                        elif event.type == "response.completed":
-                            response = event.response
-                        elif event.type in ("response.failed", "response.incomplete"):
-                            raise RuntimeError(f"LLM streaming failed: {event.type}")
-                    if response is None:
-                        raise RuntimeError("LLM stream ended without response.completed")
-                finally:
-                    if hasattr(response_stream, "close"):
-                        response_stream.close()
-            else:
-                response = client.responses.create(**kwargs)
             # A control received during sampling invalidates the old result.
             if controller is not None and controller.has_pending():
                 raise StaleLLMResponse()
@@ -248,7 +229,7 @@ def _consume_controls(
 
 
 # Main Agent Loop: one durable Turn per invocation in this MVP.
-def agent_loop(user_prompt: str, *, stream: bool = False,
+def agent_loop(user_prompt: str, *,
                event_sink: TurnEventSink | None = None,
                db_path: str | None = None) -> str:
     context_budget = ContextBudget(
@@ -282,7 +263,7 @@ def agent_loop(user_prompt: str, *, stream: bool = False,
                 compact_session(session, client)
             response = call_llm_with_retry_and_extend_history(
                 session, total_steps, trace,
-                controller=controller, stream=stream, event_sink=event_sink,
+                controller=controller, event_sink=event_sink,
             )
             if response is None:
                 continue  # A queued control invalidated this model response.
@@ -353,11 +334,8 @@ def cli_event_sink(event: TurnEvent) -> None:
     """Simple event renderer; replaceable by an IDE or app-server adapter."""
     if event.type == "turn_started":
         print(f"Session ID: {event.data['session_id']}", flush=True)
-    elif event.type == "text_delta":
-        sys.stdout.write(event.data["text"])
-        sys.stdout.flush()
     elif event.type == "turn_completed":
-        print("", flush=True)
+        print("[Turn completed]", flush=True)
     elif event.type == "turn_interrupted":
         print("\nTurn interrupted. Completed side effects are not rolled back.", flush=True)
     elif event.type == "steering_applied":
@@ -382,9 +360,6 @@ if __name__ == "__main__":
 
     new_command = commands.add_parser("new", help="Run a new agent turn")
     new_command.add_argument("prompt")
-    new_command.add_argument("--stream", action="store_true",
-                             help="Stream LLM text deltas to stdout")
-
     inspect_command = commands.add_parser("inspect", help="Inspect an existing session")
     inspect_command.add_argument("--session", required=True, dest="session_id")
 
@@ -411,8 +386,6 @@ if __name__ == "__main__":
         print(f"Control {control_id} queued for active session {args.session_id}")
     else:
         prompt = args.prompt if args.command == "new" else "List my current project working directory."
-        streaming = getattr(args, "stream", False)
-        assistant_message = agent_loop(prompt, stream=streaming, event_sink=cli_event_sink)
-        if not streaming:
-            logger.info("\n[Agent Response]")
-            logger.info(assistant_message)
+        assistant_message = agent_loop(prompt, event_sink=cli_event_sink)
+        logger.info("\n[Agent Response]")
+        logger.info(assistant_message)
