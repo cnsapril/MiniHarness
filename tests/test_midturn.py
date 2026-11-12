@@ -183,7 +183,7 @@ class MidturnTest(unittest.TestCase):
 
     def test_stream_commits_only_complete_model_responses(self):
         response = SimpleNamespace(
-            output=[{"role": "assistant", "content": "All done"}],
+            output=[{"type": "message", "role": "assistant", "content": "All done"}],
             output_text="All done", id="response-final", usage=None,
         )
         class Stream:
