@@ -157,6 +157,56 @@ class MidturnTest(unittest.TestCase):
                          ["partial"])
         self.assertEqual(self.controller.consume_pending(), ControlAction.STEERED)
 
+    def test_steer_during_first_handler_preserves_first_effect_and_cancels_second(self):
+        calls = [self.function_call("A"), self.function_call("B")]
+        self.session.append(calls)
+        invoked = []
+        def handler(content):
+            invoked.append(content)
+            if content == "A":
+                self.submit("STEER", "Do not run the remaining changes")
+            return "done"
+        reg = ToolRegistry([ToolSpec(
+            "write_file", handler, ToolSafety.SIDE_EFFECTING, "test", {},
+            permission=PermissionRequirement.ALLOW,
+        )])
+        executed = execute_function_calls(
+            self.session, ToolExecutionManager(self.log, reg),
+            SimpleNamespace(output=calls), 0, 1, AgentTrace(),
+            controller=self.controller,
+        )
+        self.assertEqual(executed, 2)
+        self.assertEqual(invoked, ["A"])
+        self.assertEqual(self.log.get_tool_execution("A")["state"], "RESULT_RECORDED")
+        self.assertEqual(self.log.get_tool_execution("B")["state"], "DENIED")
+        self.assertEqual(RecoveryInspector(self.log).inspect().unresolved, ())
+
+    def test_stream_commits_only_complete_model_responses(self):
+        response = SimpleNamespace(
+            output=[{"role": "assistant", "content": "All done"}],
+            output_text="All done", id="response-final", usage=None,
+        )
+        class Stream:
+            def __iter__(self):
+                yield SimpleNamespace(type="response.output_text.delta", delta="All ")
+                yield SimpleNamespace(type="response.output_text.delta", delta="done")
+                yield SimpleNamespace(type="response.completed", response=response)
+            def close(self):
+                pass
+        fake_client = SimpleNamespace(
+            responses=SimpleNamespace(create=lambda **kwargs: Stream())
+        )
+        received = []
+        with patch("main.client", fake_client):
+            result = call_llm_with_retry_and_extend_history(
+                self.session, 0, AgentTrace(), controller=self.controller,
+                stream=True, event_sink=received.append,
+            )
+        self.assertIs(result, response)
+        self.assertEqual(self.session.get_history()[-1]["content"], "All done")
+        self.assertEqual("".join(e.data["text"] for e in received
+                                 if e.type == "text_delta"), "All done")
+
     def test_turn_finishing_is_blocked_by_pending_control(self):
         self.submit()
         self.assertFalse(self.log.finish_turn("COMPLETED", require_no_pending=True))
