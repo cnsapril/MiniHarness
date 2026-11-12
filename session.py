@@ -61,6 +61,28 @@ class AgentSession:
             self.context_manager.invalidate()
             raise
 
+    def apply_steering(self, control_id: int, content: str) -> None:
+        """Commit the accepted steering input before exposing it to the model."""
+        item = {"role": "user", "content": content}
+        self.execution_log.apply_control(control_id, item)
+        self._history.append(deepcopy(item))
+        try:
+            self.context_manager.append(self._history, [item])
+        except Exception:
+            self.context_manager.invalidate()
+            raise
+
+    def cancel_recorded_tool(self, interaction: ToolInteraction) -> None:
+        """Record an unstarted tool cancellation with its required function output."""
+        output_item = deepcopy(interaction.output)
+        self.execution_log.cancel_recorded_tool(interaction)
+        self._history.append(output_item)
+        try:
+            self.context_manager.append(self._history, [output_item])
+        except Exception:
+            self.context_manager.invalidate()
+            raise
+
     def record_tool_interaction(self, interaction: ToolInteraction,
                                 expected_started_count: int) -> None:
         """Commit the STARTED version, output and ledger before updating context."""
