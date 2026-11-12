@@ -26,6 +26,9 @@ class AgentSession:
             elif item["kind"] == "history_items":
                 # 处理历史消息replay
                 session._replay_history_items(item["items"])
+            elif item["kind"] == "turn_interrupted":
+                # Control metadata has no conversation item to replay.
+                continue
             else:
                 raise ValueError(f"Unrecognized kind {item['kind']}")
         # restore结束，直接重置token cache，下次lazy recalculate
