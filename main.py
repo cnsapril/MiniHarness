@@ -55,7 +55,8 @@ def record_success_llm_trace(trace: AgentTrace, start: float, total_steps: int, 
         input_tokens=response.usage.input_tokens if response.usage else None,
         output_tokens=response.usage.output_tokens if response.usage else None,
         response_id=response.id,
-        output_types=[item.type for item in response.output],
+        output_types=[item.get("type", "unknown") if isinstance(item, dict)
+                      else item.type for item in response.output],
         success=True,
         attempt=attempt
     ))
