@@ -174,6 +174,32 @@ class SQLiteExecutionLog:
             """, (self.session_id,))
             return True
 
+    def interrupt_turn(self, control_id: int) -> None:
+        """Accept an interrupt and finalize the turn in one transaction."""
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            updated = self.conn.execute("""
+                UPDATE turn_controls SET state = 'APPLIED'
+                WHERE session_id = ? AND id = ? AND kind = 'INTERRUPT'
+                  AND state = 'PENDING'
+            """, (self.session_id, control_id))
+            if updated.rowcount != 1:
+                raise ValueError("Interrupt no longer pending")
+            updated = self.conn.execute("""
+                UPDATE agent_turns SET state = 'INTERRUPTED'
+                WHERE session_id = ? AND state = 'RUNNING'
+            """, (self.session_id,))
+            if updated.rowcount != 1:
+                raise ValueError("Turn is not running")
+            self.conn.execute("""
+                UPDATE turn_controls SET state = 'UNHANDLED'
+                WHERE session_id = ? AND state = 'PENDING'
+            """, (self.session_id,))
+            self.conn.execute("""
+                INSERT INTO events(session_id, kind, payload)
+                VALUES (?, 'turn_interrupted', ?)
+            """, (self.session_id, json.dumps({"control_id": control_id})))
+
     def get_session_id(self) -> str:
         return self.session_id
 
