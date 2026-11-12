@@ -48,7 +48,7 @@ class SQLiteExecutionLog:
                 tool_name TEXT NOT NULL,
                 input_json TEXT NOT NULL,
                 state TEXT NOT NULL CHECK(
-                    state IN ('RECORDED', 'STARTED', 'RETRY_READY', 'RESULT_RECORDED', 'DENIED')
+                    state IN ('RECORDED', 'STARTED', 'RETRY_READY', 'RESULT_RECORDED', 'DENIED', 'CANCELLED')
                 ),
                 started_count INTEGER NOT NULL DEFAULT 0 CHECK(started_count >= 0),
                 PRIMARY KEY (session_id, call_id)
@@ -71,7 +71,106 @@ class SQLiteExecutionLog:
                   REFERENCES tool_executions(session_id, call_id)
             )
         """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS agent_turns (
+                session_id TEXT PRIMARY KEY,
+                state TEXT NOT NULL CHECK(state IN ('RUNNING', 'COMPLETED', 'INTERRUPTED', 'FAILED'))
+            )
+        """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS turn_controls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES agent_turns(session_id),
+                kind TEXT NOT NULL CHECK(kind IN ('STEER', 'INTERRUPT')),
+                content TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'PENDING'
+                    CHECK(state IN ('PENDING', 'APPLIED', 'UNHANDLED'))
+            )
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_turn_controls_pending
+            ON turn_controls(session_id, state, id)
+        """)
         self.conn.commit()
+
+    def start_turn(self):
+        """Register a live turn before the CLI announces its session ID."""
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO agent_turns(session_id, state) VALUES (?, 'RUNNING')",
+                (self.session_id,)
+            )
+
+    def post_control(self, kind: str, content: str = "") -> int:
+        """Trusted local CLI submission, allowed only while the turn is active."""
+        if kind not in ("STEER", "INTERRUPT"):
+            raise ValueError("Unknown control kind")
+        if not isinstance(content, str) or len(content) > 4096:
+            raise ValueError("Invalid control content")
+        if kind == "STEER" and not content.strip():
+            raise ValueError("Steering text must not be blank")
+        with self.conn:
+            turn = self.conn.execute(
+                "SELECT state FROM agent_turns WHERE session_id = ?", (self.session_id,)
+            ).fetchone()
+            if turn is None or turn[0] != "RUNNING":
+                raise ValueError("No active turn for this session")
+            cursor = self.conn.execute(
+                "INSERT INTO turn_controls(session_id, kind, content) VALUES (?, ?, ?)",
+                (self.session_id, kind, content.strip())
+            )
+            return cursor.lastrowid
+
+    def get_pending_controls(self) -> list[dict]:
+        rows = self.conn.execute("""
+            SELECT id, kind, content FROM turn_controls
+            WHERE session_id = ? AND state = 'PENDING' ORDER BY id
+        """, (self.session_id,)).fetchall()
+        return [{"id": r[0], "kind": r[1], "content": r[2]} for r in rows]
+
+    def has_pending_control(self) -> bool:
+        return self.conn.execute("""
+            SELECT 1 FROM turn_controls WHERE session_id = ? AND state = 'PENDING'
+            LIMIT 1
+        """, (self.session_id,)).fetchone() is not None
+
+    def apply_control(self, control_id: int, history_item: dict) -> None:
+        """Atomically acknowledge the control and append its user input to history."""
+        serializable = ContextHelper.serialize_items([history_item])
+        with self.conn:
+            updated = self.conn.execute("""
+                UPDATE turn_controls SET state = 'APPLIED'
+                WHERE id = ? AND session_id = ? AND state = 'PENDING'
+            """, (control_id, self.session_id))
+            if updated.rowcount != 1:
+                raise ValueError("Control already consumed")
+            self.conn.execute(
+                "INSERT INTO events(session_id, kind, payload) VALUES (?, 'history_items', ?)",
+                (self.session_id, json.dumps({"items": serializable}, ensure_ascii=False))
+            )
+
+    def finish_turn(self, state: str, *, require_no_pending: bool = False) -> bool:
+        """Finalize atomically against concurrent control submission.
+
+        Successful completion requires an empty control queue. Failure/interrupt
+        terminates the turn and explicitly identifies any unhandled controls.
+        """
+        if state not in ("COMPLETED", "INTERRUPTED", "FAILED"):
+            raise ValueError("Invalid terminal state")
+        with self.conn:
+            if require_no_pending and self.has_pending_control():
+                return False
+            updated = self.conn.execute("""
+                UPDATE agent_turns SET state = ?
+                WHERE session_id = ? AND state = 'RUNNING'
+            """, (state, self.session_id))
+            if updated.rowcount != 1:
+                raise ValueError("Turn is not running")
+            self.conn.execute("""
+                UPDATE turn_controls SET state = 'UNHANDLED'
+                WHERE session_id = ? AND state = 'PENDING'
+            """, (self.session_id,))
+            return True
 
     def get_session_id(self) -> str:
         return self.session_id
@@ -174,6 +273,11 @@ class SQLiteExecutionLog:
         """Consume Approval (if required) and grant STARTED with the same CAS transaction."""
         expected_state = "RETRY_READY" if retry else "RECORDED"
         with self.conn:
+            # Admission and the steering/interrupt queue share the same SQLite
+            # transaction boundary, so an already-arrived control wins over
+            # launching another stale tool (including after an approval prompt).
+            if self.has_pending_control():
+                raise ValueError("Pending steering or interrupt; tool not admitted")
             if require_approval:
                 updated = self.conn.execute(
                     """UPDATE tool_approvals SET status = 'CONSUMED'
@@ -267,6 +371,27 @@ class SQLiteExecutionLog:
                 raise ValueError(
                     f"Stale or invalid tool result commit: {interaction.call_id}"
                 )
+            self._append_output_and_ledger(interaction, payload)
+
+    def cancel_recorded_tool(self, interaction: ToolInteraction) -> None:
+        """Finalize an unstarted stale call with a durable cancellation output.
+
+        Never cancel STARTED: its external side effects may be unknown.
+        """
+        payload = interaction.to_payload()
+        with self.conn:
+            updated = self.conn.execute("""
+                UPDATE tool_executions SET state = 'CANCELLED'
+                WHERE session_id = ? AND call_id = ? AND state = 'RECORDED'
+                  AND started_count = 0 AND input_json = ?
+            """, (self.session_id, interaction.call_id,
+                  json.dumps(interaction.input, ensure_ascii=False)))
+            if updated.rowcount != 1:
+                raise ValueError(f"Call already started or not recorded: {interaction.call_id}")
+            self.conn.execute("""
+                UPDATE tool_approvals SET status = 'REJECTED'
+                WHERE session_id = ? AND call_id = ? AND status IN ('PENDING', 'APPROVED')
+            """, (self.session_id, interaction.call_id))
             self._append_output_and_ledger(interaction, payload)
 
     def get_tool_interaction(self, call_id: str) -> ToolInteraction | None:
