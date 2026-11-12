@@ -344,20 +344,70 @@ def inspect_session(session_id: str):
         log.close()
 
 
+def cli_event_sink(event: TurnEvent) -> None:
+    """Simple event renderer; replaceable by an IDE or app-server adapter."""
+    if event.type == "turn_started":
+        print(f"Session ID: {event.data['session_id']}", flush=True)
+    elif event.type == "text_delta":
+        sys.stdout.write(event.data["text"])
+        sys.stdout.flush()
+    elif event.type == "turn_completed":
+        print("", flush=True)
+    elif event.type == "turn_interrupted":
+        print("\nTurn interrupted. Completed side effects are not rolled back.", flush=True)
+    elif event.type == "steering_applied":
+        print("\n[Steering applied at a safe boundary]", flush=True)
+    elif event.type == "tools_cancelled":
+        print(f"\n[{event.data['count']} unstarted tool call(s) cancelled]", flush=True)
+
+
+def post_turn_control(session_id: str, kind: str, content: str = "") -> int:
+    """Separate trusted CLI process can post controls while the agent is running."""
+    log = SQLiteExecutionLog(DB_PATH, session_id)
+    try:
+        return log.post_control(kind, content)
+    finally:
+        log.close()
+
+
 if __name__ == "__main__":
     setup_logging()
     parser = argparse.ArgumentParser(description="MiniHarness coding agent")
     commands = parser.add_subparsers(dest="command")
-    new_command = commands.add_parser("new", help="Run a new agent session")
+
+    new_command = commands.add_parser("new", help="Run a new agent turn")
     new_command.add_argument("prompt")
+    new_command.add_argument("--stream", action="store_true",
+                             help="Stream LLM text deltas to stdout")
+
     inspect_command = commands.add_parser("inspect", help="Inspect an existing session")
     inspect_command.add_argument("--session", required=True, dest="session_id")
+
+    steer_command = commands.add_parser("steer", help="Queue new input for an active turn")
+    steer_command.add_argument("--session", required=True, dest="session_id")
+    steer_command.add_argument("text")
+
+    interrupt_command = commands.add_parser("interrupt", help="Stop an active turn at a safe boundary")
+    interrupt_command.add_argument("--session", required=True, dest="session_id")
+
     args = parser.parse_args()
 
     if args.command == "inspect":
         inspect_session(args.session_id)
+    elif args.command in ("steer", "interrupt"):
+        try:
+            control_id = post_turn_control(
+                args.session_id,
+                "STEER" if args.command == "steer" else "INTERRUPT",
+                args.text if args.command == "steer" else "",
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        print(f"Control {control_id} queued for active session {args.session_id}")
     else:
         prompt = args.prompt if args.command == "new" else "List my current project working directory."
-        assistant_message = agent_loop(prompt)
-        logger.info("\n[Agent Response]")
-        logger.info(assistant_message)
+        streaming = getattr(args, "stream", False)
+        assistant_message = agent_loop(prompt, stream=streaming, event_sink=cli_event_sink)
+        if not streaming:
+            logger.info("\n[Agent Response]")
+            logger.info(assistant_message)
