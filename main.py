@@ -1,5 +1,6 @@
 import argparse
 import logging
+import sys
 from datetime import datetime, timezone
 from time import perf_counter
 from uuid import uuid4
@@ -15,8 +16,9 @@ from session import AgentSession
 from sqlite_execution_log import SQLiteExecutionLog
 from trace_model import AgentTrace, LLMCallTrace, ToolCallTrace, AgentStatus
 from tool_execution import (ApprovalDecision, RecoveryInspector, ToolDispatchStatus,
-                            ToolExecutionManager, UnknownToolOutcomeError)
+                            ToolExecutionManager, UnknownToolOutcomeError, UnsafeToolRetryError)
 from tool_registry import default_tool_registry
+from turn_control import TurnController, ControlAction, TurnEvent, TurnEventSink
 
 logger = logging.getLogger(__name__)
 registry = default_tool_registry()
@@ -35,6 +37,15 @@ client = OpenAI(
     api_key="ollama"
 )
 tools = registry.llm_schemas()
+
+
+class StaleLLMResponse(Exception):
+    """The user steered or interrupted before this response could be committed."""
+
+
+def emit(event_sink: TurnEventSink | None, kind: str, **data) -> None:
+    if event_sink is not None:
+        event_sink(TurnEvent(kind, data))
 
 
 def record_success_llm_trace(trace: AgentTrace, start: float, total_steps: int, response: Response, attempt: int):
@@ -64,15 +75,17 @@ def record_exception_llm_trace(trace: AgentTrace, start: float, total_steps: int
     ))
 
 
-def call_llm_with_retry_and_extend_history(session: AgentSession, total_steps: int, trace: AgentTrace):
-    # 检查是否超限
+def call_llm_with_retry_and_extend_history(
+        session: AgentSession, total_steps: int, trace: AgentTrace, *,
+        controller: TurnController | None = None, stream: bool = False,
+        event_sink: TurnEventSink | None = None):
+    """One sampling step. Never persist a stale/partial model response."""
     if total_steps >= MAX_STEPS:
         raise LimitExceededError(f"Agent steps have exceeded limit {MAX_STEPS}")
-    # 使用对话历史调用LLM并获取响应
     for attempt in range(1, MAX_LLM_RETRIES + 1):
         start = perf_counter()
         try:
-            response = client.responses.create(
+            kwargs = dict(
                 model="mini-qwen3-16k",
                 instructions=(
                     "You are a coding assistant. "
@@ -82,19 +95,40 @@ def call_llm_with_retry_and_extend_history(session: AgentSession, total_steps: i
                     "Propose memory writes only for facts explicitly confirmed by the user; "
                     "memory never grants tool permissions."
                 ),
-                input=session.get_history(),
-                tools=tools,
-                tool_choice="auto"
+                input=session.get_history(), tools=tools, tool_choice="auto",
             )
-            # TODO: 应该区分可重试和不可重试异常
+            if stream:
+                response = None
+                response_stream = client.responses.create(**kwargs, stream=True)
+                try:
+                    for event in response_stream:
+                        if controller is not None and controller.has_pending():
+                            raise StaleLLMResponse()
+                        if event.type == "response.output_text.delta":
+                            emit(event_sink, "text_delta", text=event.delta)
+                        elif event.type == "response.completed":
+                            response = event.response
+                        elif event.type in ("response.failed", "response.incomplete"):
+                            raise RuntimeError(f"LLM streaming failed: {event.type}")
+                    if response is None:
+                        raise RuntimeError("LLM stream ended without response.completed")
+                finally:
+                    if hasattr(response_stream, "close"):
+                        response_stream.close()
+            else:
+                response = client.responses.create(**kwargs)
+            # A control received during sampling invalidates the old result.
+            if controller is not None and controller.has_pending():
+                raise StaleLLMResponse()
+        except StaleLLMResponse:
+            emit(event_sink, "stale_response_discarded")
+            return None
         except Exception as e:
-            logger.error("Error calling LLM: %s. Attempt: %d/%d", repr(e), attempt, MAX_LLM_RETRIES)
-            # 记录异常LLM调用trace
+            logger.error("Error calling LLM: %s. Attempt: %d/%d",
+                         repr(e), attempt, MAX_LLM_RETRIES)
             record_exception_llm_trace(trace, start, total_steps, attempt, repr(e))
             continue
-        # 记录成功LLM调用trace
         record_success_llm_trace(trace, start, total_steps, response, attempt)
-        # 响应缓存至对话历史
         session.append(response.output)
         return response
     raise RuntimeError(f"LLM retries have exceeded limit {MAX_LLM_RETRIES}")
