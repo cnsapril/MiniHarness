@@ -110,6 +110,7 @@ class SQLiteExecutionLog:
         if kind == "STEER" and not content.strip():
             raise ValueError("Steering text must not be blank")
         with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
             turn = self.conn.execute(
                 "SELECT state FROM agent_turns WHERE session_id = ?", (self.session_id,)
             ).fetchone()
@@ -158,6 +159,7 @@ class SQLiteExecutionLog:
         if state not in ("COMPLETED", "INTERRUPTED", "FAILED"):
             raise ValueError("Invalid terminal state")
         with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
             if require_no_pending and self.has_pending_control():
                 return False
             updated = self.conn.execute("""
@@ -273,6 +275,7 @@ class SQLiteExecutionLog:
         """Consume Approval (if required) and grant STARTED with the same CAS transaction."""
         expected_state = "RETRY_READY" if retry else "RECORDED"
         with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
             # Admission and the steering/interrupt queue share the same SQLite
             # transaction boundary, so an already-arrived control wins over
             # launching another stale tool (including after an approval prompt).
